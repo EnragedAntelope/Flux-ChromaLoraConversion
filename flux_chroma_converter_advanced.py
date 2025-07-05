@@ -860,11 +860,11 @@ class FluxToChromaConverter:
                                 alpha=effective_alpha
                             )
                             
-                            # Apply add dissimilar if similarity is low
-                            # Use a lower threshold for better detection
-                            similarity = self.calculate_tensor_similarity(a_compute, result)
-                            if abs(similarity) < (1.0 - self.config.dissimilarity_threshold * 0.5):
-                                result = self.add_dissimilar(result, a_compute, threshold=self.config.dissimilarity_threshold * 0.5)
+                            # Apply add dissimilar with more aggressive detection
+                            # Calculate difference magnitude instead of similarity
+                            diff_magnitude = torch.norm(b_compute - c_compute) / (torch.norm(b_compute) + 1e-8)
+                            if diff_magnitude > self.config.dissimilarity_threshold * 0.1:  # Much lower threshold
+                                result = self.add_dissimilar(result, a_compute, threshold=self.config.dissimilarity_threshold * 0.2)
                                 dissimilar_enhanced_count += 1
                         else:
                             # Standard difference merge
@@ -922,11 +922,12 @@ class FluxToChromaConverter:
                     original = original_dict[key].to(self.device, dtype=torch.float32)
                     modified = modified_dict[key].to(self.device, dtype=torch.float32)
                     
-                    # Apply add dissimilar if configured with lower threshold for better detection
+                    # Apply add dissimilar if configured with more aggressive detection
                     if self.config.use_comparative_interpolation:
-                        similarity = self.calculate_tensor_similarity(original, modified)
-                        if abs(similarity) < (1.0 - self.config.dissimilarity_threshold * 0.3):
-                            modified = self.add_dissimilar(modified, original, threshold=self.config.dissimilarity_threshold * 0.3)
+                        # Use normalized difference as metric
+                        diff_norm_ratio = diff_norm / (torch.norm(original) + 1e-8)
+                        if diff_norm_ratio > self.config.dissimilarity_threshold * 0.01:  # Very low threshold
+                            modified = self.add_dissimilar(modified, original, threshold=self.config.dissimilarity_threshold * 0.1)
                             dissimilar_enhanced_count += 1
                     
                     diff = modified - original
@@ -995,8 +996,8 @@ class FluxToChromaConverter:
         if self.config.force_extract_all:
             logger.info("Force extract mode was enabled")
         
-        # Calculate actual size
-        total_params = sum(t.numel() for t in lora_dict.values() if 'alpha' not in t)
+        # Calculate actual size - fix the check to look at keys, not tensor values
+        total_params = sum(t.numel() for k, t in lora_dict.items() if 'alpha' not in k and isinstance(t, torch.Tensor))
         logger.info(f"Total LoRA parameters: {total_params:,}")
         
         return lora_dict
@@ -1162,8 +1163,8 @@ class FluxToChromaConverter:
         logger.info(f"LoRA tensors: {len(extracted_lora)}")
         logger.info(f"LoRA layers: {len(extracted_lora) // 3}")
         
-        # Calculate actual size
-        total_params = sum(t.numel() for t in extracted_lora.values() if isinstance(t, torch.Tensor) and 'alpha' not in t)
+        # Calculate actual size - fixed to check keys instead of values
+        total_params = sum(t.numel() for k, t in extracted_lora.items() if 'alpha' not in k and isinstance(t, torch.Tensor))
         # Get dtype size
         if hasattr(self.dtype, 'itemsize'):
             dtype_size = self.dtype.itemsize
