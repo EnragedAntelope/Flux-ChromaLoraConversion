@@ -340,6 +340,27 @@ class FluxToChromaConverter:
         
         return result
 
+    def normalize_lora_key(self, key: str) -> str:
+        """Normalize LoRA key by removing common prefixes"""
+        # Remove various prefixes that might be present
+        prefixes_to_remove = [
+            'lora_unet_',
+            'model.diffusion_model.',
+            'diffusion_model.',
+            'model.',
+            'transformer.',
+            'lora_te_',
+            'lora_te1_',
+            'lora_te2_',
+        ]
+        
+        normalized_key = key
+        for prefix in prefixes_to_remove:
+            if normalized_key.startswith(prefix):
+                normalized_key = normalized_key[len(prefix):]
+        
+        return normalized_key
+
     def analyze_lora_keys(self, lora_dict: Dict[str, torch.Tensor]) -> Tuple[Dict[str, str], List[str]]:
         """Analyze LoRA keys to understand their structure"""
         lora_keys = sorted(lora_dict.keys())
@@ -347,27 +368,29 @@ class FluxToChromaConverter:
         # Extract unique base keys (without .lora_down/.lora_up/.lora_A/.lora_B suffixes)
         base_keys = set()
         for key in lora_keys:
-            if '.lora_down.weight' in key:
-                base_keys.add(key.replace('.lora_down.weight', ''))
-            elif '.lora_up.weight' in key:
-                base_keys.add(key.replace('.lora_up.weight', ''))
-            elif '.lora_A.weight' in key:
-                base_keys.add(key.replace('.lora_A.weight', ''))
-            elif '.lora_B.weight' in key:
-                base_keys.add(key.replace('.lora_B.weight', ''))
+            # Normalize the key first
+            normalized_key = self.normalize_lora_key(key)
+            
+            if '.lora_down.weight' in normalized_key:
+                base_keys.add(normalized_key.replace('.lora_down.weight', ''))
+            elif '.lora_up.weight' in normalized_key:
+                base_keys.add(normalized_key.replace('.lora_up.weight', ''))
+            elif '.lora_A.weight' in normalized_key:
+                base_keys.add(normalized_key.replace('.lora_A.weight', ''))
+            elif '.lora_B.weight' in normalized_key:
+                base_keys.add(normalized_key.replace('.lora_B.weight', ''))
         
         logger.info(f"\nAnalyzing LoRA structure:")
         logger.info(f"Total LoRA tensors: {len(lora_keys)}")
         logger.info(f"Unique LoRA layers: {len(base_keys)}")
         
         if self.config.debug_keys and base_keys:
-            logger.info("\nSample LoRA base keys:")
+            logger.info("\nSample LoRA base keys (after normalization):")
             for i, key in enumerate(sorted(base_keys)[:10]):
                 logger.info(f"  {key}")
         
         # Detect LoRA format
         lora_format = {}
-        sample_key = next(iter(base_keys)) if base_keys else ""
         
         if any('.lora_down.weight' in k for k in lora_keys):
             lora_format['down_suffix'] = '.lora_down.weight'
@@ -376,15 +399,29 @@ class FluxToChromaConverter:
             lora_format['down_suffix'] = '.lora_A.weight'
             lora_format['up_suffix'] = '.lora_B.weight'
         
-        # Detect if keys have lora_unet prefix
-        if sample_key.startswith('lora_unet_'):
-            lora_format['has_prefix'] = True
-            lora_format['prefix'] = 'lora_unet_'
-        else:
-            lora_format['has_prefix'] = False
-            lora_format['prefix'] = ''
+        # Store original keys for proper access
+        lora_format['original_keys'] = lora_keys
         
         return lora_format, list(base_keys)
+
+    def get_lora_weights_for_key(self, base_key: str, lora_dict: Dict[str, torch.Tensor], 
+                                lora_format: Dict[str, str]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Get LoRA weights for a given base key, checking all possible prefixes"""
+        possible_prefixes = ['', 'lora_unet_', 'model.diffusion_model.', 'diffusion_model.', 
+                           'model.', 'transformer.']
+        
+        down_suffix = lora_format['down_suffix']
+        up_suffix = lora_format['up_suffix']
+        
+        # Try each prefix
+        for prefix in possible_prefixes:
+            down_key = prefix + base_key + down_suffix
+            up_key = prefix + base_key + up_suffix
+            
+            if down_key in lora_dict and up_key in lora_dict:
+                return lora_dict[down_key], lora_dict[up_key]
+        
+        return None
 
     def merge_qkv_lora_weights(self, q_lora: Optional[Tuple[torch.Tensor, torch.Tensor]], 
                               k_lora: Optional[Tuple[torch.Tensor, torch.Tensor]], 
@@ -447,12 +484,8 @@ class FluxToChromaConverter:
 
     def enhanced_map_lora_key_to_model_key(self, lora_base_key: str, model_keys: List[str]) -> List[str]:
         """Enhanced mapping with more aggressive strategies"""
-        # Remove common prefixes
-        key = lora_base_key
-        if key.startswith('lora_unet_'):
-            key = key[10:]
-        if key.startswith('transformer.'):
-            key = key[12:]
+        # First normalize the key
+        key = self.normalize_lora_key(lora_base_key)
         
         potential_keys = []
         
@@ -471,6 +504,8 @@ class FluxToChromaConverter:
             ('proj_out', 'linear2'),  # Alternative mapping
             ('norm1.linear', 'img_mod.lin'),
             ('norm2.linear', 'txt_mod.lin'),
+            ('norm1_context.linear', 'txt_mod.lin'),
+            ('attn.to_out.0', 'attn.proj'),
         ]
         
         # Apply all mappings
@@ -561,14 +596,10 @@ class FluxToChromaConverter:
                 if block_key not in qkv_lora_groups:
                     qkv_lora_groups[block_key] = {'q': None, 'k': None, 'v': None}
                 
-                # Get LoRA weights
-                down_key = lora_base_key + lora_format['down_suffix']
-                up_key = lora_base_key + lora_format['up_suffix']
-                
-                if down_key in lora_state_dict and up_key in lora_state_dict:
-                    down = lora_state_dict[down_key]
-                    up = lora_state_dict[up_key]
-                    
+                # Get LoRA weights using the enhanced getter
+                weights = self.get_lora_weights_for_key(lora_base_key, lora_state_dict, lora_format)
+                if weights:
+                    down, up = weights
                     # Store by type
                     if '.to_q' in lora_base_key:
                         qkv_lora_groups[block_key]['q'] = (down, up)
@@ -612,14 +643,15 @@ class FluxToChromaConverter:
                         # Get alpha value
                         alpha = 1.0
                         if qkv_group['q'] is not None:
-                            alpha_key = None
-                            for lora_key in lora_state_dict.keys():
-                                if block_key in lora_key and '.to_q' in lora_key and '.alpha' in lora_key:
-                                    alpha_key = lora_key
+                            # Look for alpha in all possible prefixes
+                            alpha_found = False
+                            for prefix in ['', 'lora_unet_', 'model.diffusion_model.', 'diffusion_model.']:
+                                alpha_key = f"{prefix}{block_key}.attn.to_q.alpha"
+                                if alpha_key in lora_state_dict:
+                                    alpha = lora_state_dict[alpha_key].item()
+                                    alpha_found = True
                                     break
-                            if alpha_key and alpha_key in lora_state_dict:
-                                alpha = lora_state_dict[alpha_key].item()
-                            else:
+                            if not alpha_found:
                                 alpha = qkv_group['q'][0].shape[0]
                         
                         # Convert tensors
@@ -661,33 +693,34 @@ class FluxToChromaConverter:
             if any(x in lora_base_key for x in ['.to_q', '.to_k', '.to_v']):
                 continue
             
-            # Get LoRA weights
-            down_key = lora_base_key + lora_format['down_suffix']
-            up_key = lora_base_key + lora_format['up_suffix']
-            
-            if down_key not in lora_state_dict or up_key not in lora_state_dict:
+            # Get LoRA weights using enhanced getter
+            weights = self.get_lora_weights_for_key(lora_base_key, lora_state_dict, lora_format)
+            if not weights:
                 continue
+            
+            down, up = weights
             
             # Use enhanced mapping
             model_keys = self.enhanced_map_lora_key_to_model_key(lora_base_key, list(merged_state_dict.keys()))
             
             for model_key in model_keys:
                 try:
-                    down = lora_state_dict[down_key].to(self.device, dtype=self.dtype)
-                    up = lora_state_dict[up_key].to(self.device, dtype=self.dtype)
+                    down_device = down.to(self.device, dtype=self.dtype)
+                    up_device = up.to(self.device, dtype=self.dtype)
                     model_weight = merged_state_dict[model_key].to(self.device, dtype=self.dtype)
                     
-                    # Get alpha
-                    alpha_key = lora_base_key + '.alpha'
-                    if alpha_key in lora_state_dict:
-                        alpha = lora_state_dict[alpha_key].item()
-                    else:
-                        alpha = down.shape[0]
+                    # Get alpha - check all possible prefixes
+                    alpha = down.shape[0]  # Default
+                    for prefix in ['', 'lora_unet_', 'model.diffusion_model.', 'diffusion_model.']:
+                        alpha_key = f"{prefix}{lora_base_key}.alpha"
+                        if alpha_key in lora_state_dict:
+                            alpha = lora_state_dict[alpha_key].item()
+                            break
                     
                     # Apply LoRA with amplification
                     scale = alpha / down.shape[0]
                     effective_strength = strength * self.config.amplify_strength
-                    lora_weight = scale * torch.matmul(up, down) * effective_strength
+                    lora_weight = scale * torch.matmul(up_device, down_device) * effective_strength
                     
                     if lora_weight.shape == model_weight.shape:
                         if self.config.use_comparative_interpolation:
@@ -828,9 +861,10 @@ class FluxToChromaConverter:
                             )
                             
                             # Apply add dissimilar if similarity is low
+                            # Use a lower threshold for better detection
                             similarity = self.calculate_tensor_similarity(a_compute, result)
-                            if similarity < (1.0 - self.config.dissimilarity_threshold):
-                                result = self.add_dissimilar(result, a_compute)
+                            if abs(similarity) < (1.0 - self.config.dissimilarity_threshold * 0.5):
+                                result = self.add_dissimilar(result, a_compute, threshold=self.config.dissimilarity_threshold * 0.5)
                                 dissimilar_enhanced_count += 1
                         else:
                             # Standard difference merge
@@ -888,11 +922,11 @@ class FluxToChromaConverter:
                     original = original_dict[key].to(self.device, dtype=torch.float32)
                     modified = modified_dict[key].to(self.device, dtype=torch.float32)
                     
-                    # Apply add dissimilar if configured
+                    # Apply add dissimilar if configured with lower threshold for better detection
                     if self.config.use_comparative_interpolation:
                         similarity = self.calculate_tensor_similarity(original, modified)
-                        if similarity < (1.0 - self.config.dissimilarity_threshold):
-                            modified = self.add_dissimilar(modified, original)
+                        if abs(similarity) < (1.0 - self.config.dissimilarity_threshold * 0.3):
+                            modified = self.add_dissimilar(modified, original, threshold=self.config.dissimilarity_threshold * 0.3)
                             dissimilar_enhanced_count += 1
                     
                     diff = modified - original
@@ -915,7 +949,6 @@ class FluxToChromaConverter:
                             S_r = S[:actual_rank]
                             Vh_r = Vh[:actual_rank, :]
                             
-                            # Create LoRA matrices with proper scaling
                             # Apply additional amplification to extracted values
                             amplify_factor = self.config.amplify_strength
                             
@@ -923,20 +956,23 @@ class FluxToChromaConverter:
                             if self.config.use_comparative_interpolation:
                                 noise_scale = self.config.interpolation_noise_scale * 0.1  # Smaller noise for extraction
                                 noise_down = torch.randn_like(Vh_r) * noise_scale
-                                noise_up = torch.randn_like(U_r @ torch.diag(S_r)) * noise_scale
+                                noise_up = torch.randn(U_r.shape[0], actual_rank, device=U_r.device, dtype=U_r.dtype) * noise_scale
                                 
-                                lora_down = (Vh_r + noise_down) * amplify_factor
-                                lora_up = ((U_r @ torch.diag(S_r)) + noise_up) * amplify_factor
+                                # Create properly sized LoRA matrices
+                                lora_down = (Vh_r + noise_down) * amplify_factor  # Shape: [rank, in_features]
+                                lora_up = (U_r @ torch.diag(torch.sqrt(S_r)) + noise_up) * amplify_factor  # Shape: [out_features, rank]
+                                lora_up = lora_up @ torch.diag(torch.sqrt(S_r))  # Include singular values
                             else:
-                                lora_down = Vh_r * amplify_factor
-                                lora_up = (U_r @ torch.diag(S_r)) * amplify_factor
+                                # Standard extraction with proper sizing
+                                lora_down = Vh_r * amplify_factor  # Shape: [rank, in_features]
+                                lora_up = (U_r @ torch.diag(S_r)) * amplify_factor  # Shape: [out_features, rank]
                             
                             # Store in LoRA format
                             base_key = key.replace('.weight', '')
                             lora_dict[f"{base_key}.lora_down.weight"] = lora_down.cpu().to(self.dtype)
                             lora_dict[f"{base_key}.lora_up.weight"] = lora_up.cpu().to(self.dtype)
                             
-                            # Store alpha = rank
+                            # Store alpha = rank (as float tensor for compatibility)
                             lora_dict[f"{base_key}.alpha"] = torch.tensor(float(actual_rank))
                             
                             extracted_count += 1
@@ -958,6 +994,11 @@ class FluxToChromaConverter:
             logger.info(f"Enhanced {dissimilar_enhanced_count} dissimilar layers")
         if self.config.force_extract_all:
             logger.info("Force extract mode was enabled")
+        
+        # Calculate actual size
+        total_params = sum(t.numel() for t in lora_dict.values() if 'alpha' not in t)
+        logger.info(f"Total LoRA parameters: {total_params:,}")
+        
         return lora_dict
 
     def convert(self):
@@ -984,6 +1025,12 @@ class FluxToChromaConverter:
         logger.info("\n=== Step 1: Loading LoRA ===")
         lora_dict = load_file(self.config.lora_path)
         logger.info(f"Loaded LoRA with {len(lora_dict)} tensors")
+        
+        # Check for model/diffusion_model prefixes
+        sample_keys = list(lora_dict.keys())[:5]
+        logger.info("Sample LoRA keys (checking for prefixes):")
+        for key in sample_keys:
+            logger.info(f"  {key}")
         
         # Step 2: Merge LoRA with Flux model
         logger.info("\n=== Step 2: Merging LoRA with Flux model ===")
@@ -1115,10 +1162,15 @@ class FluxToChromaConverter:
         logger.info(f"LoRA tensors: {len(extracted_lora)}")
         logger.info(f"LoRA layers: {len(extracted_lora) // 3}")
         
-        # Calculate size
-        total_params = sum(t.numel() for t in extracted_lora.values())
-        dtype_size = torch.finfo(self.dtype).bits // 8
-        size_mb = total_params * dtype_size / (1024 * 1024)
+        # Calculate actual size
+        total_params = sum(t.numel() for t in extracted_lora.values() if isinstance(t, torch.Tensor) and 'alpha' not in t)
+        # Get dtype size
+        if hasattr(self.dtype, 'itemsize'):
+            dtype_size = self.dtype.itemsize
+        else:
+            # Fallback for older PyTorch versions
+            dtype_size = torch.finfo(self.dtype).bits // 8
+        size_mb = (total_params * dtype_size) / (1024 * 1024)
         logger.info(f"File size: ~{size_mb:.2f} MB")
         
         if self.config.use_comparative_interpolation:
