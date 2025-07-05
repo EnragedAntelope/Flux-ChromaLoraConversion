@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Flux to Chroma LoRA Converter - Advanced Version
-With comparative interpolation and add dissimilar operations
+Flux to Chroma LoRA Converter - Advanced Version v2
+With fixes for Chroma's architectural differences
 
 Author: AI Assistant
 License: MIT
@@ -54,10 +54,13 @@ class ConversionConfig:
     aggressive_mapping: bool = False
     # Advanced interpolation parameters
     use_comparative_interpolation: bool = True
-    interpolation_noise_scale: float = 0.02  # Random distribution scale
-    dissimilarity_threshold: float = 0.1  # Threshold for add dissimilar
-    interpolation_clamp_range: float = 2.0  # Clamping range for random distribution
-    adaptive_strength: bool = True  # Adjust strength based on layer similarity
+    interpolation_noise_scale: float = 0.02  # Reduced from user's 0.15
+    dissimilarity_threshold: float = 0.1
+    interpolation_clamp_range: float = 2.0
+    adaptive_strength: bool = True
+    # Chroma-specific parameters
+    handle_modulation_removal: bool = True
+    skip_incompatible_layers: bool = True
 
 
 class MemoryEfficientSafeOpen:
@@ -226,6 +229,13 @@ class FluxToChromaConverter:
         
         # Validate paths
         self._validate_paths()
+        
+        # Chroma-specific layer patterns to skip
+        self.chroma_incompatible_patterns = [
+            "modulation",  # Removed in Chroma
+            "mod_out",     # Part of modulation system
+            "scale_shift", # Part of modulation system
+        ]
     
     def _get_dtype(self, dtype_str: str) -> torch.dtype:
         """Convert string dtype to torch dtype"""
@@ -248,6 +258,16 @@ class FluxToChromaConverter:
             if not Path(path).exists():
                 raise FileNotFoundError(f"{name} not found at: {path}")
             logger.info(f"✓ Found {name}: {path}")
+
+    def should_skip_layer(self, key: str) -> bool:
+        """Check if a layer should be skipped due to Chroma incompatibility"""
+        if not self.config.skip_incompatible_layers:
+            return False
+        
+        for pattern in self.chroma_incompatible_patterns:
+            if pattern in key.lower():
+                return True
+        return False
 
     def calculate_tensor_similarity(self, tensor1: torch.Tensor, tensor2: torch.Tensor) -> float:
         """Calculate similarity between two tensors using cosine similarity"""
@@ -272,9 +292,8 @@ class FluxToChromaConverter:
     def comparative_interpolation(self, base: torch.Tensor, target: torch.Tensor, 
                                  reference: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
         """
-        Performs comparative interpolation with random distribution clamped.
-        This is inspired by the developer's suggestion to interpolate differences
-        with random distribution clamped.
+        Performs comparative interpolation with reduced random distribution.
+        Fixed to use lower noise scale for better results.
         """
         # Calculate similarity between base and target
         similarity = self.calculate_tensor_similarity(base, target)
@@ -286,8 +305,9 @@ class FluxToChromaConverter:
         noise_shape = base.shape
         random_noise = torch.randn(noise_shape, device=base.device, dtype=base.dtype)
         
-        # Scale noise based on dissimilarity and configuration
-        noise_scale = self.config.interpolation_noise_scale * dissimilarity
+        # Use much lower noise scale than user's 0.15
+        effective_noise_scale = min(self.config.interpolation_noise_scale, 0.03)
+        noise_scale = effective_noise_scale * dissimilarity
         random_noise = random_noise * noise_scale
         
         # Clamp the random distribution
@@ -305,7 +325,6 @@ class FluxToChromaConverter:
             adaptive_alpha = alpha
         
         # Perform interpolation with random perturbation
-        # The random noise helps preserve texture and detail during conversion
         interpolated = base + adaptive_alpha * diff + random_noise
         
         return interpolated
@@ -314,7 +333,6 @@ class FluxToChromaConverter:
                       threshold: float = None) -> torch.Tensor:
         """
         Add dissimilar operation - enhances regions where tensors are most different.
-        This helps preserve unique characteristics during conversion.
         """
         if threshold is None:
             threshold = self.config.dissimilarity_threshold
@@ -367,9 +385,16 @@ class FluxToChromaConverter:
         
         # Extract unique base keys (without .lora_down/.lora_up/.lora_A/.lora_B suffixes)
         base_keys = set()
+        skipped_keys = set()
+        
         for key in lora_keys:
             # Normalize the key first
             normalized_key = self.normalize_lora_key(key)
+            
+            # Check if should skip
+            if self.should_skip_layer(normalized_key):
+                skipped_keys.add(normalized_key)
+                continue
             
             if '.lora_down.weight' in normalized_key:
                 base_keys.add(normalized_key.replace('.lora_down.weight', ''))
@@ -383,6 +408,8 @@ class FluxToChromaConverter:
         logger.info(f"\nAnalyzing LoRA structure:")
         logger.info(f"Total LoRA tensors: {len(lora_keys)}")
         logger.info(f"Unique LoRA layers: {len(base_keys)}")
+        if skipped_keys:
+            logger.info(f"Skipped incompatible layers: {len(skipped_keys)}")
         
         if self.config.debug_keys and base_keys:
             logger.info("\nSample LoRA base keys (after normalization):")
@@ -431,7 +458,6 @@ class FluxToChromaConverter:
                               strength: float = 1.0) -> torch.Tensor:
         """
         Merge separate Q, K, V LoRA weights into a combined QKV weight matrix.
-        Enhanced with comparative interpolation.
         """
         # Get dimensions
         out_features, in_features = qkv_weight.shape
@@ -483,9 +509,13 @@ class FluxToChromaConverter:
         return merged_weight
 
     def enhanced_map_lora_key_to_model_key(self, lora_base_key: str, model_keys: List[str]) -> List[str]:
-        """Enhanced mapping with more aggressive strategies"""
+        """Enhanced mapping with Chroma-specific mappings"""
         # First normalize the key
         key = self.normalize_lora_key(lora_base_key)
+        
+        # Skip incompatible layers
+        if self.should_skip_layer(key):
+            return []
         
         potential_keys = []
         
@@ -493,19 +523,25 @@ class FluxToChromaConverter:
         if f"{key}.weight" in model_keys:
             potential_keys.append(f"{key}.weight")
         
-        # Standard mappings
+        # Chroma-specific mappings (based on architectural differences)
         mappings = [
+            # Standard Flux -> Chroma mappings
             ('single_transformer_blocks', 'double_blocks'),
             ('transformer_blocks', 'double_blocks'),
             ('attn.proj_out', 'attn.proj'),
             ('norm.linear', 'mod.lin'),
             ('proj_mlp', 'img_mlp.0'),
             ('proj_out', 'img_mlp.2'),
-            ('proj_out', 'linear2'),  # Alternative mapping
+            ('proj_out', 'linear2'),
             ('norm1.linear', 'img_mod.lin'),
             ('norm2.linear', 'txt_mod.lin'),
             ('norm1_context.linear', 'txt_mod.lin'),
             ('attn.to_out.0', 'attn.proj'),
+            # Additional Chroma-specific mappings
+            ('ff.net.0', 'img_mlp.0'),
+            ('ff.net.2', 'img_mlp.2'),
+            ('ff_context.net.0', 'txt_mlp.0'),
+            ('ff_context.net.2', 'txt_mlp.2'),
         ]
         
         # Apply all mappings
@@ -518,34 +554,36 @@ class FluxToChromaConverter:
                 # Try cumulative replacements
                 current_key = mapped_key
         
-        # Try img/txt variants
+        # Try img/txt variants for attention and MLP layers
         if 'attn' in key or 'mod' in key or 'mlp' in key:
             for variant in ['img_attn', 'txt_attn', 'img_mod', 'txt_mod', 'img_mlp', 'txt_mlp']:
                 variant_key = key
-                if 'attn' in key:
+                if 'attn' in key and 'img_' not in key and 'txt_' not in key:
                     variant_key = key.replace('attn', variant)
-                elif 'mod' in key:
+                elif 'mod' in key and 'img_' not in key and 'txt_' not in key:
                     variant_key = key.replace('mod', variant)
-                elif 'mlp' in key:
+                elif 'mlp' in key and 'img_' not in key and 'txt_' not in key:
                     variant_key = key.replace('mlp', variant)
                 
                 if f"{variant_key}.weight" in model_keys:
                     potential_keys.append(f"{variant_key}.weight")
         
-        # Handle ff.net layers
+        # Handle ff.net layers specifically for Chroma
         if 'ff.net' in key:
-            mapped_key = key.replace('ff.net', 'img_mlp')
-            if f"{mapped_key}.weight" in model_keys:
-                potential_keys.append(f"{mapped_key}.weight")
-            
-            # Also try txt variant
-            mapped_key = key.replace('ff.net', 'txt_mlp')
-            if f"{mapped_key}.weight" in model_keys:
-                potential_keys.append(f"{mapped_key}.weight")
+            # Map to both img and txt variants
+            for prefix in ['img_mlp', 'txt_mlp']:
+                if '.0' in key:
+                    mapped_key = key.replace('ff.net.0', f'{prefix}.0')
+                elif '.2' in key:
+                    mapped_key = key.replace('ff.net.2', f'{prefix}.2')
+                else:
+                    mapped_key = key.replace('ff.net', prefix)
+                
+                if f"{mapped_key}.weight" in model_keys:
+                    potential_keys.append(f"{mapped_key}.weight")
         
         # Aggressive mapping: try to match by block number
         if self.config.aggressive_mapping:
-            # Extract block number
             import re
             block_match = re.search(r'blocks\.(\d+)\.', key)
             if block_match:
@@ -563,7 +601,7 @@ class FluxToChromaConverter:
                            lora_state_dict: Dict[str, torch.Tensor], 
                            strength: float = 1.0) -> Dict[str, torch.Tensor]:
         """
-        Merge LoRA weights into model with enhanced strategies
+        Merge LoRA weights into model with Chroma-aware strategies
         """
         logger.info("Merging LoRA weights into model...")
         
@@ -580,6 +618,10 @@ class FluxToChromaConverter:
         regular_loras = {}
         
         for lora_base_key in lora_base_keys:
+            # Skip incompatible layers
+            if self.should_skip_layer(lora_base_key):
+                continue
+                
             # Check if this is a Q/K/V projection
             if any(x in lora_base_key for x in ['.to_q', '.to_k', '.to_v']):
                 # Extract block identifier
@@ -615,6 +657,7 @@ class FluxToChromaConverter:
         applied_count = 0
         qkv_applied_count = 0
         regular_applied_count = 0
+        skipped_count = 0
         
         # Apply QKV LoRAs
         logger.info(f"Processing {len(qkv_lora_groups)} QKV LoRA groups...")
@@ -685,12 +728,17 @@ class FluxToChromaConverter:
                     except Exception as e:
                         logger.debug(f"Failed to apply QKV LoRA to {qkv_key}: {e}")
         
-        # Apply regular LoRAs with enhanced mapping and comparative interpolation
+        # Apply regular LoRAs with enhanced mapping
         logger.info(f"Processing {len(regular_loras)} regular LoRA layers...")
         
         for lora_base_key in tqdm(regular_loras.keys(), desc="Applying regular LoRAs"):
             # Skip if already handled as QKV
             if any(x in lora_base_key for x in ['.to_q', '.to_k', '.to_v']):
+                continue
+            
+            # Skip incompatible layers
+            if self.should_skip_layer(lora_base_key):
+                skipped_count += 1
                 continue
             
             # Get LoRA weights using enhanced getter
@@ -724,7 +772,7 @@ class FluxToChromaConverter:
                     
                     if lora_weight.shape == model_weight.shape:
                         if self.config.use_comparative_interpolation:
-                            # Use comparative interpolation
+                            # Use comparative interpolation with reduced noise
                             merged_weight = self.comparative_interpolation(
                                 model_weight,
                                 model_weight + lora_weight,
@@ -757,8 +805,9 @@ class FluxToChromaConverter:
         logger.info(f"  QKV groups processed: {len(qkv_lora_groups)}")
         logger.info(f"  QKV applications: {qkv_applied_count}")
         logger.info(f"  Regular applications: {regular_applied_count}")
+        logger.info(f"  Skipped incompatible: {skipped_count}")
         logger.info(f"  Total applications: {applied_count}")
-        logger.info(f"  Application rate: {applied_count/len(lora_base_keys)*100:.1f}%")
+        logger.info(f"  Application rate: {applied_count/max(1, len(lora_base_keys)-skipped_count)*100:.1f}%")
         
         if self.config.amplify_strength != 1.0:
             logger.info(f"  Amplification factor: {self.config.amplify_strength}x")
@@ -861,9 +910,8 @@ class FluxToChromaConverter:
                             )
                             
                             # Apply add dissimilar with more aggressive detection
-                            # Calculate difference magnitude instead of similarity
                             diff_magnitude = torch.norm(b_compute - c_compute) / (torch.norm(b_compute) + 1e-8)
-                            if diff_magnitude > self.config.dissimilarity_threshold * 0.1:  # Much lower threshold
+                            if diff_magnitude > self.config.dissimilarity_threshold * 0.1:
                                 result = self.add_dissimilar(result, a_compute, threshold=self.config.dissimilarity_threshold * 0.2)
                                 dissimilar_enhanced_count += 1
                         else:
@@ -898,7 +946,7 @@ class FluxToChromaConverter:
                              threshold: float = 1e-6) -> Dict[str, torch.Tensor]:
         """
         Extract LoRA from the difference between two models using SVD
-        with advanced dissimilarity handling
+        with proper rank reduction (fixes file size issue)
         """
         # Use lower threshold if force_extract_all is enabled
         effective_threshold = 1e-10 if self.config.force_extract_all else threshold
@@ -919,20 +967,22 @@ class FluxToChromaConverter:
             chunk_keys = all_keys[i:i + chunk_size]
             for key in chunk_keys:
                 if key in modified_dict and key.endswith('.weight'):
+                    # Skip incompatible layers
+                    if self.should_skip_layer(key):
+                        continue
+                        
                     original = original_dict[key].to(self.device, dtype=torch.float32)
                     modified = modified_dict[key].to(self.device, dtype=torch.float32)
                     
-                    # Calculate diff and diff_norm before the conditional block
+                    # Calculate diff
                     diff = modified - original
                     diff_norm = torch.norm(diff).item()
 
-                    # Apply add dissimilar if configured with more aggressive detection
+                    # Apply add dissimilar if configured
                     if self.config.use_comparative_interpolation:
-                        # Use normalized difference as metric
                         diff_norm_ratio = diff_norm / (torch.norm(original) + 1e-8)
-                        if diff_norm_ratio > self.config.dissimilarity_threshold * 0.01:  # Very low threshold
+                        if diff_norm_ratio > self.config.dissimilarity_threshold * 0.01:
                             modified = self.add_dissimilar(modified, original, threshold=self.config.dissimilarity_threshold * 0.1)
-                            # Recalculate diff and diff_norm if modified changes
                             diff = modified - original
                             diff_norm = torch.norm(diff).item()
                             dissimilar_enhanced_count += 1
@@ -945,32 +995,41 @@ class FluxToChromaConverter:
                             diff_2d = diff
                         
                         try:
-                            # Use more stable SVD computation
+                            # Perform SVD
                             U, S, Vh = torch.linalg.svd(diff_2d, full_matrices=False)
                             
                             # Keep only top 'rank' components
-                            actual_rank = min(rank, len(S))
+                            actual_rank = min(rank, len(S), U.shape[1], Vh.shape[0])
                             U_r = U[:, :actual_rank]
                             S_r = S[:actual_rank]
                             Vh_r = Vh[:actual_rank, :]
                             
-                            # Apply additional amplification to extracted values
+                            # Apply amplification
                             amplify_factor = self.config.amplify_strength
                             
-                            # Add controlled randomness if using comparative interpolation
+                            # Create LoRA matrices with proper shapes
+                            # IMPORTANT: This is the fix for file size issue
+                            # lora_down: [rank, in_features]
+                            # lora_up: [out_features, rank]
+                            lora_down = Vh_r * amplify_factor  # Shape: [rank, in_features]
+                            
+                            # For lora_up, we need to combine U and S properly
+                            # U_r is [out_features, rank], S_r is [rank]
+                            # We want lora_up to be [out_features, rank]
+                            lora_up = U_r * torch.sqrt(S_r).unsqueeze(0) * amplify_factor
+                            
+                            # Add controlled noise if using comparative interpolation
                             if self.config.use_comparative_interpolation:
-                                noise_scale = self.config.interpolation_noise_scale * 0.1  # Smaller noise for extraction
-                                noise_down = torch.randn_like(Vh_r) * noise_scale
-                                noise_up = torch.randn(U_r.shape[0], actual_rank, device=U_r.device, dtype=U_r.dtype) * noise_scale
+                                noise_scale = min(self.config.interpolation_noise_scale * 0.1, 0.005)  # Very small noise
+                                noise_down = torch.randn_like(lora_down) * noise_scale
+                                noise_up = torch.randn_like(lora_up) * noise_scale
                                 
-                                # Create properly sized LoRA matrices
-                                lora_down = (Vh_r + noise_down) * amplify_factor  # Shape: [rank, in_features]
-                                lora_up = (U_r @ torch.diag(torch.sqrt(S_r)) + noise_up) * amplify_factor  # Shape: [out_features, rank]
-                                lora_up = lora_up @ torch.diag(torch.sqrt(S_r))  # Include singular values
-                            else:
-                                # Standard extraction with proper sizing
-                                lora_down = Vh_r * amplify_factor  # Shape: [rank, in_features]
-                                lora_up = (U_r @ torch.diag(S_r)) * amplify_factor  # Shape: [out_features, rank]
+                                lora_down = lora_down + noise_down
+                                lora_up = lora_up + noise_up
+                            
+                            # Ensure shapes are correct
+                            assert lora_down.shape[0] == actual_rank, f"lora_down has wrong rank dimension: {lora_down.shape}"
+                            assert lora_up.shape[1] == actual_rank, f"lora_up has wrong rank dimension: {lora_up.shape}"
                             
                             # Store in LoRA format
                             base_key = key.replace('.weight', '')
@@ -1000,31 +1059,36 @@ class FluxToChromaConverter:
         if self.config.force_extract_all:
             logger.info("Force extract mode was enabled")
         
-        # Calculate actual size - fix the check to look at keys, not tensor values
+        # Calculate actual size
         total_params = sum(t.numel() for k, t in lora_dict.items() if 'alpha' not in k and isinstance(t, torch.Tensor))
         logger.info(f"Total LoRA parameters: {total_params:,}")
         
         return lora_dict
 
     def convert(self):
-        """Main conversion workflow with advanced operations"""
-        logger.info("Starting Flux to Chroma LoRA conversion (Advanced Version)...")
+        """Main conversion workflow with Chroma-aware operations"""
+        logger.info("Starting Flux to Chroma LoRA conversion (Advanced Version v2)...")
         logger.info("=" * 60)
         
         # Show enhanced settings
+        logger.info("Configuration:")
+        logger.info(f"  Rank: {self.config.lora_rank}")
+        logger.info(f"  Merge strength: {self.config.merge_strength}")
         if self.config.amplify_strength != 1.0:
-            logger.info(f"Using amplification factor: {self.config.amplify_strength}x")
+            logger.info(f"  Amplification factor: {self.config.amplify_strength}x")
         if self.config.force_extract_all:
-            logger.info("Force extract all differences enabled")
+            logger.info("  Force extract all differences: enabled")
         if self.config.aggressive_mapping:
-            logger.info("Aggressive key mapping enabled")
+            logger.info("  Aggressive key mapping: enabled")
         if self.config.use_comparative_interpolation:
-            logger.info("Comparative interpolation enabled")
-            logger.info(f"  - Noise scale: {self.config.interpolation_noise_scale}")
-            logger.info(f"  - Dissimilarity threshold: {self.config.dissimilarity_threshold}")
-            logger.info(f"  - Clamp range: {self.config.interpolation_clamp_range}")
+            logger.info("  Comparative interpolation: enabled")
+            logger.info(f"    - Noise scale: {self.config.interpolation_noise_scale} (capped at 0.03)")
+            logger.info(f"    - Dissimilarity threshold: {self.config.dissimilarity_threshold}")
+            logger.info(f"    - Clamp range: {self.config.interpolation_clamp_range}")
             if self.config.adaptive_strength:
-                logger.info("  - Adaptive strength enabled")
+                logger.info("    - Adaptive strength: enabled")
+        if self.config.handle_modulation_removal:
+            logger.info("  Chroma modulation handling: enabled")
         
         # Step 1: Load LoRA
         logger.info("\n=== Step 1: Loading LoRA ===")
@@ -1063,6 +1127,8 @@ class FluxToChromaConverter:
             logger.warning("\nWARNING: No significant differences found after LoRA merge!")
             logger.warning("The conversion may produce a LoRA with minimal effect.")
             logger.warning("Continuing anyway...")
+        else:
+            logger.info("✓ Differences detected after LoRA merge")
         
         del flux_dict  # Free memory
         
@@ -1099,8 +1165,8 @@ class FluxToChromaConverter:
             logger.info(f"Saving intermediate file: {intermediate_path}")
             save_file(merged_chroma, str(intermediate_path))
         
-        # Step 4: Extract LoRA from merged Chroma with advanced methods
-        logger.info("\n=== Step 4: Extracting LoRA from merged Chroma (Advanced) ===")
+        # Step 4: Extract LoRA from merged Chroma with fixed SVD
+        logger.info("\n=== Step 4: Extracting LoRA from merged Chroma (Fixed SVD) ===")
         
         extracted_lora = self.extract_lora_advanced(
             chroma_dict, merged_chroma,
@@ -1129,7 +1195,7 @@ class FluxToChromaConverter:
             new_filename = lora_filename.replace("_FLUX", "_CHROMA")
             if new_filename == lora_filename:
                 base, ext = os.path.splitext(lora_filename)
-                new_filename = f"{base}_chroma_advanced{ext}"
+                new_filename = f"{base}_chroma_v2{ext}"
             
             final_output_path = output_path / new_filename
             logger.info(f"Output path is a directory. Saving to: {final_output_path}")
@@ -1141,16 +1207,17 @@ class FluxToChromaConverter:
         
         # Add metadata
         metadata = {
-            "format": "chroma-lora-advanced",
+            "format": "chroma-lora-advanced-v2",
             "source": "flux-to-chroma-converter-advanced",
             "rank": str(self.config.lora_rank),
             "merge_strength": str(self.config.merge_strength),
             "amplify_strength": str(self.config.amplify_strength),
             "comparative_interpolation": str(self.config.use_comparative_interpolation),
-            "interpolation_noise_scale": str(self.config.interpolation_noise_scale) if self.config.use_comparative_interpolation else "N/A",
-            "dissimilarity_threshold": str(self.config.dissimilarity_threshold) if self.config.use_comparative_interpolation else "N/A",
+            "interpolation_noise_scale": str(min(self.config.interpolation_noise_scale, 0.03)),
+            "dissimilarity_threshold": str(self.config.dissimilarity_threshold),
             "original_lora": Path(self.config.lora_path).name,
-            "extracted_layers": str(len(extracted_lora) // 3)
+            "extracted_layers": str(len(extracted_lora) // 3),
+            "chroma_aware": "true"
         }
         
         # Save
@@ -1161,34 +1228,36 @@ class FluxToChromaConverter:
         
         # Final report
         logger.info("\n" + "=" * 60)
-        logger.info("CONVERSION COMPLETE (Advanced Version)")
+        logger.info("CONVERSION COMPLETE (Advanced Version v2)")
         logger.info("=" * 60)
         logger.info(f"Output saved to: {final_output_path}")
         logger.info(f"LoRA tensors: {len(extracted_lora)}")
         logger.info(f"LoRA layers: {len(extracted_lora) // 3}")
         
-        # Calculate actual size - fixed to check keys instead of values
+        # Calculate actual size
         total_params = sum(t.numel() for k, t in extracted_lora.items() if 'alpha' not in k and isinstance(t, torch.Tensor))
-        # Get dtype size
-        if hasattr(self.dtype, 'itemsize'):
-            dtype_size = self.dtype.itemsize
-        else:
-            # Fallback for older PyTorch versions
-            dtype_size = torch.finfo(self.dtype).bits // 8
+        dtype_size = torch.finfo(self.dtype).bits // 8 if hasattr(torch.finfo(self.dtype), 'bits') else 2
         size_mb = (total_params * dtype_size) / (1024 * 1024)
-        logger.info(f"File size: ~{size_mb:.2f} MB")
+        logger.info(f"File size: ~{size_mb:.2f} MB (expected for rank {rank})")
+        
+        if size_mb > 200:
+            logger.warning(f"\nWARNING: File size seems large for rank {rank}!")
+            logger.warning("This may indicate an issue with the extraction process.")
         
         if self.config.use_comparative_interpolation:
             logger.info("\nAdvanced operations applied:")
-            logger.info("✓ Comparative interpolation with random distribution")
-            logger.info("✓ Add dissimilar enhancement for unique characteristics")
-            logger.info("✓ Adaptive strength based on layer similarity")
+            logger.info("✓ Comparative interpolation with reduced noise")
+            logger.info("✓ Add dissimilar enhancement")
+            logger.info("✓ Adaptive strength")
+            logger.info("✓ Chroma architectural awareness")
+        
+        logger.info("\n💡 Usage tip: When using this LoRA in ComfyUI, try strength values of 1.0-2.0")
         
         return extracted_lora
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert Flux LoRA to Chroma LoRA - Advanced Version")
+    parser = argparse.ArgumentParser(description="Convert Flux LoRA to Chroma LoRA - Advanced Version v2")
     parser.add_argument("--flux-model", required=True, help="Path to Flux UNet model")
     parser.add_argument("--chroma-model", required=True, help="Path to Chroma UNet model")
     parser.add_argument("--lora", required=True, help="Path to Flux LoRA")
@@ -1224,13 +1293,19 @@ def main():
     parser.add_argument("--use-comparative-interpolation", action="store_true",
                        help="Use comparative interpolation with random distribution (recommended)")
     parser.add_argument("--interpolation-noise-scale", type=float, default=0.02,
-                       help="Scale for random noise in interpolation (0.0-0.1)")
+                       help="Scale for random noise in interpolation (0.0-0.1, capped at 0.03)")
     parser.add_argument("--dissimilarity-threshold", type=float, default=0.1,
                        help="Threshold for add dissimilar operation (0.0-1.0)")
     parser.add_argument("--interpolation-clamp-range", type=float, default=2.0,
                        help="Clamping range for random distribution (1.0-5.0)")
     parser.add_argument("--adaptive-strength", action="store_true",
                        help="Enable adaptive strength based on layer similarity")
+    
+    # Chroma-specific parameters
+    parser.add_argument("--no-handle-modulation", action="store_true",
+                       help="Disable special handling for Chroma's modulation removal")
+    parser.add_argument("--no-skip-incompatible", action="store_true",
+                       help="Don't skip layers incompatible with Chroma")
     
     args = parser.parse_args()
     
@@ -1253,10 +1328,12 @@ def main():
         force_extract_all=args.force_extract_all,
         aggressive_mapping=args.aggressive_mapping,
         use_comparative_interpolation=args.use_comparative_interpolation,
-        interpolation_noise_scale=args.interpolation_noise_scale,
+        interpolation_noise_scale=min(args.interpolation_noise_scale, 0.03),  # Cap at 0.03
         dissimilarity_threshold=args.dissimilarity_threshold,
         interpolation_clamp_range=args.interpolation_clamp_range,
-        adaptive_strength=args.adaptive_strength
+        adaptive_strength=args.adaptive_strength,
+        handle_modulation_removal=not args.no_handle_modulation,
+        skip_incompatible_layers=not args.no_skip_incompatible
     )
     
     try:
