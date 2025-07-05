@@ -922,16 +922,20 @@ class FluxToChromaConverter:
                     original = original_dict[key].to(self.device, dtype=torch.float32)
                     modified = modified_dict[key].to(self.device, dtype=torch.float32)
                     
+                    # Calculate diff and diff_norm before the conditional block
+                    diff = modified - original
+                    diff_norm = torch.norm(diff).item()
+
                     # Apply add dissimilar if configured with more aggressive detection
                     if self.config.use_comparative_interpolation:
                         # Use normalized difference as metric
                         diff_norm_ratio = diff_norm / (torch.norm(original) + 1e-8)
                         if diff_norm_ratio > self.config.dissimilarity_threshold * 0.01:  # Very low threshold
                             modified = self.add_dissimilar(modified, original, threshold=self.config.dissimilarity_threshold * 0.1)
+                            # Recalculate diff and diff_norm if modified changes
+                            diff = modified - original
+                            diff_norm = torch.norm(diff).item()
                             dissimilar_enhanced_count += 1
-                    
-                    diff = modified - original
-                    diff_norm = torch.norm(diff).item()
                     
                     if diff_norm > effective_threshold:
                         original_shape = diff.shape
