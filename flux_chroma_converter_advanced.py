@@ -1238,10 +1238,10 @@ class FluxToChromaConverter:
         total_params = sum(t.numel() for k, t in extracted_lora.items() if 'alpha' not in k and isinstance(t, torch.Tensor))
         dtype_size = torch.finfo(self.dtype).bits // 8 if hasattr(torch.finfo(self.dtype), 'bits') else 2
         size_mb = (total_params * dtype_size) / (1024 * 1024)
-        logger.info(f"File size: ~{size_mb:.2f} MB (expected for rank {rank})")
+        logger.info(f"File size: ~{size_mb:.2f} MB (expected for rank {self.config.lora_rank})")
         
         if size_mb > 200:
-            logger.warning(f"\nWARNING: File size seems large for rank {rank}!")
+            logger.warning(f"\nWARNING: File size seems large for rank {self.config.lora_rank}!")
             logger.warning("This may indicate an issue with the extraction process.")
         
         if self.config.use_comparative_interpolation:
