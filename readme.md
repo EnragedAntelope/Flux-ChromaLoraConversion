@@ -28,7 +28,7 @@ Chroma is a heavily modified variant based on Flux Schnell with fewer parameters
 
 ### Basic Conversion
 ```bash
-python flux-chroma-converter-fixed.py \
+python flux-chroma-converter.py \
     --flux-base "path/to/flux1-dev.safetensors" \
     --flux-lora "path/to/your-flux-lora.safetensors" \
     --chroma-base "path/to/chroma-model.safetensors" \
@@ -37,7 +37,7 @@ python flux-chroma-converter-fixed.py \
 
 ### Windows Example
 ```cmd
-python flux-chroma-converter-fixed.py ^
+python flux-chroma-converter.py ^
     --flux-base "D:\models\flux1-dev.safetensors" ^
     --flux-lora "D:\loras\my-character.safetensors" ^
     --chroma-base "D:\models\chroma-unlocked.safetensors" ^
@@ -67,10 +67,10 @@ python flux-chroma-converter-fixed.py ^
 If you encounter out-of-memory errors:
 ```bash
 # Use CPU mode (slower but uses system RAM)
-python flux-chroma-converter-fixed.py ... --device cpu
+python flux-chroma-converter.py ... --device cpu
 
 # Reduce chunk size
-python flux-chroma-converter-fixed.py ... --chunk-size 10
+python flux-chroma-converter.py ... --chunk-size 10
 
 # Use system with more RAM/VRAM
 ```
