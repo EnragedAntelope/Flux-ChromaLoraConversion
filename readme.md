@@ -2,8 +2,6 @@
 
 This repository contains a set of tools to convert LoRAs made for the Flux model to be compatible with Chroma, a heavily modified and more efficient variant. It includes a powerful converter and an essential pre-flight compatibility scanner.
 
-This toolset is aligned with **Converter v15.0**, which includes a definitive, evidence-based fix for correctly converting T5 Text Encoder weights, a common point of failure in previous tools.
-
 ## 🎯 Overview
 
 Chroma is a streamlined model variant based on Flux, with a different architecture and fewer parameters. Standard Flux LoRAs are not directly compatible. This converter uses an advanced "apply-difference-extract" method to rebuild the LoRA's influence within the Chroma architecture.
