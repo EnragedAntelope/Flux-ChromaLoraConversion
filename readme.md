@@ -1,220 +1,160 @@
-# Flux to Chroma LoRA Converter
+# Flux to Chroma LoRA Converter & Scanner
 
-Convert Flux Dev LoRAs to work with the Chroma model, enabling you to use your favorite Flux LoRAs with this exciting new model variant.
+This repository contains a set of tools to convert LoRAs made for the Flux model to be compatible with Chroma, a heavily modified and more efficient variant. It includes a powerful converter and an essential pre-flight compatibility scanner.
+
+This toolset is aligned with **Converter v15.0**, which includes a definitive, evidence-based fix for correctly converting T5 Text Encoder weights, a common point of failure in previous tools.
 
 ## 🎯 Overview
 
-Chroma is a heavily modified variant based on Flux Schnell with fewer parameters (8.9B vs 12B). This tool converts Flux Dev LoRAs to be compatible with Chroma using an advanced add-difference merge technique.
+Chroma is a streamlined model variant based on Flux, with a different architecture and fewer parameters. Standard Flux LoRAs are not directly compatible. This converter uses an advanced "apply-difference-extract" method to rebuild the LoRA's influence within the Chroma architecture.
 
 ### Key Features
-- ✅ Converts Flux Dev LoRAs to Chroma-compatible format
-- ✅ Preserves trigger words and metadata
-- ✅ Memory-efficient chunk processing
-- ✅ Automatic rank detection
-- ✅ Multiple conversion quality modes
-- ✅ Compatibility pre-scanning
+- **High-Fidelity UNet Conversion**: Intelligently merges and rebuilds UNet layers, handling various LoRA formats (Kohya, Diffusers) and accumulating weights from multiple components (e.g., Q, K, V projections) into single layers.
+- **Definitive Text Encoder Fix**: Correctly converts T5 Text Encoder (`lora_te1`) weights, allowing for complex character and style LoRAs to function properly. Skips unsupported TE weights (`lora_te2`) to avoid errors.
+- **Compatibility Pre-Scanner**: Analyze your LoRAs *before* conversion to get a detailed report and a compatibility score, saving you time and effort.
+- **Batch Processing**: Convert an entire folder of LoRAs with a single command.
+- **Metadata Preservation**: Automatically carries over trigger words and other metadata from the original LoRA to the converted version.
+- **Memory Efficiency**: Uses chunk-based processing and CPU fallbacks to handle large models on systems with limited VRAM.
+- **Auto-Detection**: Automatically detects the LoRA's rank and naming style.
 
 ## 📋 Requirements
 
 - Python 3.8+
-- PyTorch with CUDA support (or CPU mode)
-- 16GB+ RAM recommended (24GB+ for GPU mode)
-- Required packages:
-  ```bash
-  pip install torch safetensors numpy tqdm
-  ```
+- PyTorch (CPU or CUDA version)
+- 16GB+ of System RAM is recommended for CPU mode.
+- 24GB+ of VRAM is recommended for GPU mode.
 
-## 🚀 Quick Start
-
-### Basic Conversion
+Install the required packages using pip:
 ```bash
-python flux-chroma-converter.py \
-    --flux-base "path/to/flux1-dev.safetensors" \
-    --flux-lora "path/to/your-flux-lora.safetensors" \
-    --chroma-base "path/to/chroma-model.safetensors" \
-    --output-lora "your-chroma-lora.safetensors"
+pip install torch safetensors numpy tqdm psutil gputil
 ```
+*(Note: `psutil` and `gputil` are optional but recommended for memory monitoring in debug mode).*
 
-### Windows Example
-```cmd
-python flux-chroma-converter.py ^
-    --flux-base "D:\models\flux1-dev.safetensors" ^
-    --flux-lora "D:\loras\my-character.safetensors" ^
-    --chroma-base "D:\models\chroma-unlocked.safetensors" ^
-    --output-lora "my-character-chroma.safetensors"
-```
+---
 
-## 🛠️ Main Converter Options
+## ⭐ Important: Use the Pruned Flux Model
 
-### Required Arguments
-- `--flux-base`: Path to Flux Dev base model (12B parameters)
-- `--flux-lora`: Path to Flux Dev LoRA to convert
-- `--chroma-base`: Path to Chroma base model
-- `--output-lora`: Output path for converted Chroma LoRA
+For the conversion process, you **must** use a Flux base model. It is **strongly recommended** to use the pruned version to save disk space and reduce load times, as it is functionally identical for this process.
 
-### Optional Arguments
-- `--device`: Computation device (`cuda` or `cpu`, default: cuda)
-- `--rank`: LoRA rank for extraction (default: -1 for auto-detect)
-- `--lora-alpha`: LoRA merge strength (default: 1.0)
-- `--chunk-size`: Memory chunk size (default: 50, reduce if OOM)
-- `--mode`: Conversion mode - `standard`, `add_dissimilar`, or `comparative`
-- `--similarity-threshold`: Threshold for add_dissimilar mode (0.0-1.0)
-- `--debug`: Enable detailed debug output
-- `--verify-only`: Test compatibility without conversion
-- `--inspect-output`: Inspect a converted LoRA file
+- **Model:** `flux1-dev-pruned.safetensors`
+- **Download Link:** [Hugging Face - silveroxides/pruned-models](https://huggingface.co/silveroxides/pruned-models/blob/main/flux1-dev-pruned.safetensors)
 
-### Memory Management
-If you encounter out-of-memory errors:
+---
+
+## 🚀 Quick Start Guide
+
+The recommended workflow is to first scan your LoRAs for compatibility and then convert the best candidates.
+
+### Step 1: Scan LoRAs for Compatibility
+
+Before converting, use the scanner to see which of your LoRAs are good candidates. This tool analyzes the LoRA's structure and gives it a score based on how many of its layers can be converted.
+
+**Scan an entire directory and get a report:**
 ```bash
-# Use CPU mode (slower but uses system RAM)
-python flux-chroma-converter.py ... --device cpu
-
-# Reduce chunk size
-python flux-chroma-converter.py ... --chunk-size 10
-
-# Use system with more RAM/VRAM
-```
-
-## 🔍 Compatibility Scanner
-
-Check if your Flux LoRAs are suitable for conversion before processing:
-
-### Scan Single LoRA
-```bash
-python flux-chroma-compatibility-scanner.py \
-    --lora "path/to/flux-lora.safetensors"
-```
-
-### Scan Entire Directory
-```bash
-python flux-chroma-compatibility-scanner.py \
-    --scan-dir "D:\models\loras\flux" \
-    --top-n 20 \
+python flux-chroma-compatibility-scanner.py ^
+    --scan-dir "D:\path\to\your\flux-loras" ^
+    --min-score 70 ^
     --save-report "compatibility_report.txt"
 ```
 
-### Scanner Options
-- `--lora`: Single LoRA file to analyze
-- `--scan-dir`: Directory to scan for LoRAs
-- `--top-n`: Number of top results to show (default: 10)
-- `--min-score`: Minimum compatibility score (default: 50.0)
-- `--save-report`: Save detailed report to file
-- `--debug`: Show error details
+**Interpreting the Score:**
+- **90-100% (Excellent):** Ideal candidate. Most or all of the LoRA's effect should transfer.
+- **70-89% (Good):** High chance of success. The LoRA should work well, though some minor aspects might be lost.
+- **50-69% (Fair):** Partial conversion. The LoRA might work for broad styles but may lose character-specific details.
+- **< 50% (Poor):** Not recommended. The LoRA likely targets layers that don't exist in Chroma.
 
-### Compatibility Scoring
-- **90-100%**: Excellent - Full conversion expected
-- **70-89%**: Good - Should work with minor limitations
-- **50-69%**: Fair - Partial compatibility, some features missing
-- **Below 50%**: Poor - Not recommended for conversion
+### Step 2: Convert Your LoRA
 
-## 📊 Additional Tools
+Once you've identified a good candidate, use the converter.
 
-### LoRA Inspector
-Examine the structure of any LoRA file:
-```bash
-python inspect-chroma-lora.py "path/to/lora.safetensors"
+**Basic Single-File Conversion:**
+```cmd
+python flux-chroma-converter.py ^
+    --flux-base "D:\models\flux1-dev-pruned.safetensors" ^
+    --chroma-base "D:\models\chroma-unlocked.safetensors" ^
+    --flux-lora "D:\flux-loras\my-character.safetensors"
 ```
+*(The output will be automatically named `my-character-chroma.safetensors` in the same folder).*
 
-### LoRA Structure Analyzer
-Compare working Chroma LoRAs with converted ones:
+**Batch Conversion:**
 ```bash
-python analyze_working_chroma_lora.py \
-    --working-lora "known-good-chroma-lora.safetensors" \
-    --converted-lora "your-converted-lora.safetensors"
+python flux-chroma-converter.py  ^
+    --flux-base "/path/to/models/flux1-dev-pruned.safetensors"  ^
+    --chroma-base "/path/to/models/chroma-unlocked.safetensors"  ^
+    --lora-folder "/path/to/flux-loras/"
 ```
+*(This will convert all `.safetensors` files in the folder, appending `-chroma` to each filename).*
 
-### Diagnostic Tool
-Diagnose issues with converted LoRAs:
-```bash
-python diagnose-chroma-lora.py \
-    --chroma-lora "converted-lora.safetensors" \
-    --chroma-base "chroma-model.safetensors" \
-    --flux-lora "original-flux-lora.safetensors"
-```
+## 🛠️ Command-Line Options
 
-## 💡 Understanding the Conversion Process
+### Compatibility Scanner (`flux-chroma-compatibility-scanner.py`)
+
+- `--lora`: Path to a single LoRA file to analyze.
+- `--scan-dir`: Path to a directory to scan for LoRAs.
+- `--min-score`: (Optional) Only show LoRAs with a score at or above this value (0-100).
+- `--top-n`: (Optional) Show the top N results when scanning a directory. Default is 10.
+- `--save-report`: (Optional) Save the full, detailed report to a text file.
+- `--json`: (Optional) Save the results as a JSON file.
+- `--detailed`: (Optional) Show more structural details in the console output.
+
+### Converter (`flux-chroma-converter.py`)
+
+**Required Arguments:**
+- `--flux-base`: Path to the Flux base model (e.g., `flux1-dev-pruned.safetensors`).
+- `--chroma-base`: Path to the Chroma base model.
+- `--flux-lora` OR `--lora-folder`: Path to the input LoRA file or a folder of LoRAs.
+
+**Optional Arguments:**
+- `--output-lora`: Path for the converted LoRA. If omitted, the output is auto-named. (Ignored in batch mode).
+- `--device`: The device to use for processing. `cuda` for GPU, `cpu` for system RAM. (Default: `cuda`).
+- `--rank`: The rank for the extracted LoRA. Use `-1` to auto-detect from the original LoRA's UNet layers. (Default: -1).
+- `--lora-alpha`: The strength to use when merging the LoRA into the Flux model. (Default: 1.0).
+- `--chunk-size`: Number of layers to process at once. Lower this if you get out-of-memory errors. (Default: 50).
+- `--skip-text-encoder`: Use this flag to *prevent* the script from converting text encoder weights.
+- `--analyze-only`: Run the analysis portion without performing the conversion.
+- `--skip-validation`: Skips the final validation step that checks LoRA shape compatibility.
+- `--debug`: Enable verbose logging for troubleshooting.
+
+## 💡 Understanding the Process
 
 ### How It Works
-1. **Merge**: LoRA weights are merged into Flux Dev base model
-2. **Difference**: Computes the difference between merged and original models
-3. **Apply**: Transfers differences to Chroma base model
-4. **Extract**: Extracts new LoRA from the modified Chroma model
+The conversion is a four-step process designed to translate a LoRA's influence from one model architecture to another:
+1.  **Apply LoRA**: The original Flux LoRA is merged into the Flux base model at full strength.
+2.  **Extract Difference**: The script calculates the precise difference (the "delta") between the original Flux model and the LoRA-merged version.
+3.  **Apply Difference**: This "delta" is then applied to the Chroma base model, effectively transferring the LoRA's changes.
+4.  **Extract LoRA**: A brand new, Chroma-native LoRA is extracted from the modified Chroma model using SVD (Singular Value Decomposition).
 
 ### What Gets Converted
-- ✅ Attention layers (img_attn, txt_attn)
-- ✅ MLP layers (img_mlp, txt_mlp)
-- ✅ Linear layers in single blocks
-- ✅ Trigger words and metadata
-- ❌ Modulation layers (not used by Chroma)
-- ❌ Text encoder weights
-
-### Expected Results
-- Converted LoRAs typically work best at strength 1.0-1.5
-- Character/style LoRAs maintain good likeness
-- Some fine details may differ from original Flux output
-- Single-block-only LoRAs (76 layers) work but with limitations
-- Full LoRAs (231 layers) provide best results
+- ✅ **UNet Layers**: All compatible attention and feed-forward/MLP layers in both single and double blocks are converted.
+- ✅ **T5 Text Encoder**: The script correctly handles `lora_te1` weights, which are crucial for many style and character LoRAs.
+- ✅ **Metadata**: Trigger words, tags, and other information are preserved.
+- ❌ **Modulation Layers**: These layers exist in Flux but not in Chroma. They are safely skipped. You may see "key not loaded" warnings for these in ComfyUI, which is normal and expected.
+- ❌ **CLIP-L Text Encoder**: `lora_te2` weights are not used by the standard Chroma workflow and are safely skipped.
 
 ## 🐛 Troubleshooting
 
-### Common Issues
+**Problem: CUDA Out of Memory error.**
+- **Solution 1:** Rerun the command with `--device cpu`. This will be slower but will use your system's RAM instead of VRAM.
+- **Solution 2:** If you want to use your GPU, lower the processing chunk size with `--chunk-size 20` or `--chunk-size 10`.
 
-**Out of Memory**
-```
-Error: CUDA out of memory
-Solution: Use --device cpu or --chunk-size 10
-```
+**Problem: The converted LoRA loads but has no effect on the image.**
+- **Reason 1:** The original LoRA may have had a very low compatibility score, meaning it primarily affected modulation layers that don't exist in Chroma.
+- **Reason 2:** The LoRA might be a "Text Encoder only" LoRA. Check the conversion log to see if any UNet layers were processed. If not, you need to use prompts that activate the text encoder part of the LoRA.
 
-**No Effect on Output**
-```
-Issue: LoRA loads but doesn't affect image
-Check: If compatibility scanner indicated high compatibility. Also check ComfyUI/other tool error messages during lora load.
-```
+**Problem: I see "key not loaded" warnings in my ComfyUI console.**
+- This is usually normal. The converter skips layers from the Flux LoRA that Chroma doesn't use (like `...norm...` or `...mod...` layers). As long as the LoRA works, these warnings can be ignored.
 
-**Missing Layers Warning**
-```
-Warning: lora key not loaded: modulation_lin
-This is normal - Chroma doesn't use modulation layers
-```
-
-### Debugging Steps
-1. Run compatibility scanner first
-2. Use `--debug` flag for detailed output
-3. Inspect converted LoRA structure
-4. Test with known working LoRAs
-5. Try different conversion modes
+**Problem: The conversion fails with an error.**
+- Rerun the command with the `--debug` flag to get a detailed error log. This can help identify if it's a file path issue, a corrupted input file, or a bug.
 
 ## 📈 Best Practices
 
-1. **Pre-scan LoRAs**: Use compatibility scanner before conversion
-2. **Start with Standard Mode**: Try other modes only if needed
-3. **Test at Multiple Strengths**: Converted LoRAs may need 1.0-1.5x strength
-4. **Keep Original Files**: Always preserve original Flux LoRAs
-5. **Monitor Memory**: Close other applications during conversion
-6. **Batch Processing**: Convert multiple LoRAs sequentially, not in parallel
-
-## 🔬 Technical Details
-
-### Architecture Differences
-- **Flux Dev**: 12B parameters with modulation layers
-- **Chroma**: 8.9B parameters, based on Flux Schnell architecture
-- **Missing**: 3.3B modulation layer parameters
-
-### LoRA Structure
-- Flux format: Various naming conventions
-- Chroma format: `lora_unet_` prefix with underscores
-- Shape orientation: Critical for proper matrix multiplication
-
-### Supported Training Configurations
-- ✅ Full training (double + single blocks)
-- ✅ Single blocks only
-- ⚠️ Double blocks only (limited compatibility)
-- ❌ Text encoder only
+1.  **Scan First, Convert Later**: Always use the `flux-chroma-compatibility-scanner.py` script first to check which LoRAs are worth converting.
+2.  **Use Batch Mode**: For converting multiple files, the `--lora-folder` argument is much more efficient than running the script manually for each file.
+3.  **Start with Default Settings**: The default rank and alpha settings are designed to work well for most LoRAs. Only adjust them if you are not getting the desired results.
+4.  **Test at Different Strengths**: A converted LoRA might have a slightly different "feel." Test it in your image generator at strengths from `0.8` to `1.2` to find the new sweet spot.
+5.  **Keep Your Originals**: Never delete your original Flux LoRAs.
 
 ## 📝 License
 
-This tool is provided as-is for research and personal use. Please respect the licenses of the models and LoRAs you convert.
-
-## Help Improve This!
-
-PRs are welcome if you identify any bugs or potential enhancements. 
+This tool is provided under the MIT License. You are free to use, modify, and distribute it. Please respect the licenses of the models and LoRAs you are converting.
