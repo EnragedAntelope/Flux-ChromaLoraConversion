@@ -1,535 +1,437 @@
 #!/usr/bin/env python3
 """
-Flux to Chroma LoRA Compatibility Scanner v3
-Comprehensive analysis based on complete understanding of architecture
+Flux to Chroma LoRA Compatibility Scanner v6
+Analyzes Flux LoRAs for Chroma conversion compatibility.
+Aligned with converter v15.0, which correctly handles Text Encoder keys.
+Includes option to filter by minimum compatibility score.
 """
 
 import argparse
-from safetensors import safe_open
-from collections import defaultdict
-import json
+import os
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Set
-import traceback
+from safetensors import safe_open
+from typing import Dict, List, Tuple, Optional, Any
 import re
+from collections import defaultdict, Counter
+import json
 
-def normalize_lora_key_for_analysis(key: str) -> Tuple[str, str]:
-    """
-    Normalize LoRA key and determine what it targets
-    Returns (normalized_key, target_type)
-    """
-    # Remove prefixes
-    normalized = key
-    for prefix in ["lora_unet_", "lora.", "transformer.", "model.", "diffusion_model.", "unet."]:
-        if normalized.startswith(prefix):
-            normalized = normalized[len(prefix):]
-    
-    # Remove LoRA suffixes
-    for suffix in [".lora_A.weight", ".lora_B.weight", ".lora_up.weight", ".lora_down.weight", 
-                   ".alpha", ".weight", ".bias"]:
-        if normalized.endswith(suffix):
-            normalized = normalized[:-len(suffix)]
-            break
-    
-    # Determine target type
-    target_type = "unknown"
-    
-    # Check for known non-existent layers
-    if "proj_out" in normalized and "single" in normalized:
-        target_type = "nonexistent_single_proj_out"
-    elif "norm.linear" in normalized and "single" in normalized:
-        target_type = "nonexistent_norm_linear"
-    # Modulation layers
-    elif any(mod in normalized.lower() for mod in ["modulation", "mod_lin", "_mod", ".mod"]):
-        target_type = "modulation"
-    # Single block patterns
-    elif "single" in normalized:
-        if any(x in normalized for x in ["to_q", "to_k", "to_v"]):
-            target_type = "single_attention_qkv"
-        elif "to_out" in normalized or "proj_mlp" in normalized:
-            target_type = "single_output"
-        elif "ff.net" in normalized:
-            target_type = "single_ff"
-        elif "linear1" in normalized:
-            target_type = "single_linear1"
-        elif "linear2" in normalized:
-            target_type = "single_linear2"
-    # Double block patterns
-    elif "double" in normalized or ("transformer_blocks" in normalized and "single" not in normalized):
-        if "img_attn" in normalized or ("attn" in normalized and "context" not in normalized):
-            if any(x in normalized for x in ["to_q", "to_k", "to_v"]):
-                target_type = "double_img_attention_qkv"
-            else:
-                target_type = "double_img_attention"
-        elif "txt_attn" in normalized or "attn_context" in normalized:
-            if any(x in normalized for x in ["to_q", "to_k", "to_v"]):
-                target_type = "double_txt_attention_qkv"
-            else:
-                target_type = "double_txt_attention"
-        elif "img_mlp" in normalized:
-            target_type = "double_img_mlp"
-        elif "txt_mlp" in normalized or "ff_context" in normalized:
-            target_type = "double_txt_mlp"
-    
-    return normalized, target_type
+# Key mapping patterns - ALIGNED WITH CONVERTER v15.0 for consistency
+DIFFUSERS_KEY_MAPPING = {
+    # Single blocks - Flux only has linear1, linear2, and norm layers
+    r"single_transformer_blocks\.(\d+)\.attn\.to_q": "single_blocks.{}.linear1",
+    r"single_transformer_blocks\.(\d+)\.attn\.to_k": "single_blocks.{}.linear1",
+    r"single_transformer_blocks\.(\d+)\.attn\.to_v": "single_blocks.{}.linear1",
+    r"single_transformer_blocks\.(\d+)\.attn\.to_out\.0": "single_blocks.{}.linear2",
+    r"single_transformer_blocks\.(\d+)\.ff\.net\.0\.proj": "single_blocks.{}.linear1",
+    r"single_transformer_blocks\.(\d+)\.ff\.net\.2": "single_blocks.{}.linear2",
+    r"single_transformer_blocks\.(\d+)\.proj_mlp": "single_blocks.{}.linear1", # Alias for ff.net.0.proj
+    r"single_transformer_blocks\.(\d+)\.proj_out": "single_blocks.{}.linear2",
+    r"single_transformer_blocks\.(\d+)\.norm\.linear": None,  # Skip - doesn't exist in flux1-dev
 
-def detect_naming_style(keys: List[str]) -> str:
-    """Detect the LoRA naming style with more precision"""
-    style_votes = defaultdict(int)
+    # Double blocks (transformer_blocks without 'single')
+    r"transformer_blocks\.(\d+)\.attn\.to_q": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn\.to_k": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn\.to_v": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn\.to_out\.0": "double_blocks.{}.img_attn.proj",
+    r"transformer_blocks\.(\d+)\.ff\.net\.0\.proj": "double_blocks.{}.img_mlp.0",
+    r"transformer_blocks\.(\d+)\.ff\.net\.2": "double_blocks.{}.img_mlp.2",
+    r"transformer_blocks\.(\d+)\.ff_context\.net\.0\.proj": "double_blocks.{}.txt_mlp.0",
+    r"transformer_blocks\.(\d+)\.ff_context\.net\.2": "double_blocks.{}.txt_mlp.2",
     
-    for key in keys[:50]:  # Check more keys
-        if "transformer.single_transformer_blocks" in key:
-            style_votes["diffusers"] += 1
-        elif "transformer.transformer_blocks" in key and "single" not in key:
-            style_votes["diffusers"] += 1
-        elif "_blocks_" in key and ("lora_unet_" in key or key.count("_") > 3):
-            style_votes["kohya"] += 1
-        elif "double_blocks." in key or "single_blocks." in key:
-            style_votes["standard"] += 1
+    # Context attention for double blocks
+    r"transformer_blocks\.(\d+)\.attn_context\.to_q": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn_context\.to_k": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn_context\.to_v": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn_context\.to_out\.0": "double_blocks.{}.txt_attn.proj",
     
-    if style_votes:
-        return max(style_votes.items(), key=lambda x: x[1])[0]
+    # Handle norm layers for double blocks - these don't exist in flux-dev, so skip them.
+    r"transformer_blocks\.(\d+)\.norm1\.linear": None, # Skip - doesn't exist in flux1-dev
+    r"transformer_blocks\.(\d+)\.norm1_context\.linear": None, # Skip - doesn't exist in flux1-dev
+    
+    # Diffusers-specific attention layers (these are aliases for the above, handled by the merger)
+    r"transformer_blocks\.(\d+)\.attn\.add_q_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn\.add_k_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn\.add_v_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks\.(\d+)\.attn\.to_add_out": "double_blocks.{}.img_attn.proj",
+    
+    # General text encoder patterns (skip these from UNet normalization)
+    r"text_encoder.*": None,
+    r"te_.*": None,
+    r"lora_te.*": None,
+    r"lora_te1.*": None,
+    r"lora_te2.*": None,
+    r"unet\.time_embedding.*": None,
+    r"unet\.label_emb.*": None,
+}
+
+# Additional direct mappings for edge cases
+DIRECT_KEY_MAPPING = {
+    # These are exact replacements, not patterns
+    "transformer.proj_out": None,  # Skip - doesn't exist
+    "transformer.norm_out.linear": None,  # Skip - doesn't exist
+}
+
+def normalize_lora_key(key: str) -> Optional[str]:
+    """
+    Normalize a LoRA key to match Flux structure.
+    This function is an exact copy of the one in the converter for consistency.
+    """
+    original_key = key
+    
+    # Remove .lora_A.weight, .lora_B.weight suffixes
+    key = re.sub(r'\.lora_[AB]\.weight$', '', key)
+    key = re.sub(r'\.lora_(up|down)\.weight$', '', key)
+    key = re.sub(r'\.alpha$', '', key)
+    
+    # Remove prefix if present
+    if key.startswith('lora_unet_'):
+        # This logic handles pre-normalized keys but the converter is more robust
+        key = key[len('lora_unet_'):].replace('_', '.')
+        return key
+    elif any(key.startswith(prefix) for prefix in ['lora_te', 'text_encoder', 'te_', 'lora_te1', 'lora_te2']):
+        return None  # Skip text encoder from UNet normalization
+    elif key.startswith('unet.'):
+        key = key[5:]
+    elif key.startswith('transformer.'):
+        key = key[12:]
+    elif key.startswith('model.'):
+        key = key[6:]
+    elif key.startswith('diffusion_model.'):
+        key = key[16:]
+    
+    # Check direct mappings first
+    if key in DIRECT_KEY_MAPPING:
+        return DIRECT_KEY_MAPPING[key]
+    
+    # Try pattern-based mappings
+    for pattern, replacement in DIFFUSERS_KEY_MAPPING.items():
+        match = re.match(pattern, key)
+        if match:
+            if replacement is None:
+                return None
+            else:
+                return replacement.format(*match.groups())
+    
+    # If no mapping found, return the key as-is for the analyzer to classify
+    return key
+
+def is_modulation_layer(key: str) -> bool:
+    """Check if a key is a true modulation layer (exists in Flux but not Chroma)"""
+    modulation_keywords = [
+        "_mod.", ".mod.", "_mod_", ".modulation.",
+        "mod_out", "norm_out", "scale_shift",
+        "mod.lin", "modulated", "norm_k.", "norm_q.",
+        "img_mod", "txt_mod", "vector_in",
+        "guidance_in", "timestep_embedder"
+    ]
+    
+    for mod in modulation_keywords:
+        if mod in key:
+            if "norm_added" in key:
+                continue
+            return True
+    
+    return False
+
+def detect_lora_format(keys: List[str]) -> str:
+    """Detect the LoRA format based on key patterns"""
+    if any(".lora_up." in k or ".lora_down." in k for k in keys):
+        return "diffusers"
+    elif any(".lora_A." in k or ".lora_B." in k for k in keys):
+        return "kohya"
     return "unknown"
 
-def analyze_lora_structure(lora_path: str) -> Dict:
-    """Comprehensive LoRA structure analysis"""
-    
-    analysis = {
-        "path": str(lora_path),
-        "filename": Path(lora_path).name,
-        "file_size_mb": Path(lora_path).stat().st_size / (1024 * 1024),
-        "total_keys": 0,
+def get_base_key(key: str) -> str:
+    """Extract base key from LoRA key"""
+    base = re.sub(r'\.lora_[AB]\.weight$', '', key)
+    base = re.sub(r'\.lora_(up|down)\.weight$', '', base)
+    base = re.sub(r'\.alpha$', '', base)
+    return base
+
+def analyze_lora_keys(keys: List[str]) -> Dict[str, Any]:
+    """Analyze LoRA keys for patterns and structure"""
+    analysis: Dict[str, Any] = {
+        "total_keys": len(keys),
         "unet_keys": 0,
         "text_encoder_keys": 0,
-        "naming_style": "unknown",
-        "layer_distribution": defaultdict(int),
-        "target_types": defaultdict(int),
+        "format": "unknown",
+        "layer_types": Counter(),
+        "block_distribution": Counter(),
+    }
+    
+    analysis["format"] = detect_lora_format(keys)
+    
+    base_keys = set()
+    for key in keys:
+        if any(te in key for te in ["text_encoder", "lora_te", "te_", "lora_te1", "lora_te2"]):
+            analysis["text_encoder_keys"] += 1
+        else:
+            analysis["unet_keys"] += 1
+        
+        base = get_base_key(key)
+        if not base.endswith((".weight", ".alpha")):
+            base_keys.add(base)
+    
+    for base in base_keys:
+        if "attn" in base:
+            analysis["layer_types"]["attention"] += 1
+        elif "ff" in base or "mlp" in base:
+            analysis["layer_types"]["feedforward"] += 1
+        elif "norm" in base:
+            analysis["layer_types"]["normalization"] += 1
+        
+        if "single_transformer_blocks" in base:
+            analysis["block_distribution"]["single_blocks"] += 1
+        elif "transformer_blocks" in base:
+            analysis["block_distribution"]["double_blocks"] += 1
+            
+    analysis["unique_base_keys"] = len(base_keys)
+    return analysis
+
+def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Dict[str, Any]:
+    """Check compatibility of a single LoRA file"""
+    result: Dict[str, Any] = {
+        "path": lora_path,
+        "compatible": False,
+        "score": 0.0,
         "issues": [],
         "warnings": [],
-        "rank": None,
-        "metadata": {},
-        "trigger_words": None,
-        "convertible_stats": {
+        "stats": {},
+        "conversion_stats": {
             "total_pairs": 0,
-            "convertible": 0,
+            "convertible_unet_pairs": 0,
+            "convertible_text_encoder_pairs": 0,
             "will_accumulate": 0,
             "will_skip_modulation": 0,
-            "will_skip_nonexistent": 0
+            "will_skip_unsupported": 0,
         }
     }
     
     try:
         with safe_open(lora_path, framework="pt", device="cpu") as f:
-            # Get metadata
-            if hasattr(f, 'metadata') and f.metadata():
-                metadata = f.metadata()
-                analysis["metadata"] = metadata
-                
-                # Look for trigger words
-                trigger_keys = ["trigger_words", "trigger_word", "instance_prompt", 
-                               "ss_instance_prompt", "prompt", "activation_text", 
-                               "modelspec.trigger_phrase"]
-                for key in trigger_keys:
-                    if key in metadata and metadata[key]:
-                        analysis["trigger_words"] = str(metadata[key])
-                        break
-                
-                # Get rank
-                if "ss_network_dim" in metadata:
-                    analysis["rank"] = int(metadata["ss_network_dim"])
-            
-            # Analyze keys
             keys = list(f.keys())
-            analysis["total_keys"] = len(keys)
             
-            # Detect naming style
-            analysis["naming_style"] = detect_naming_style(keys)
+            metadata = f.metadata() or {}
+            analysis = analyze_lora_keys(keys)
+            result["stats"] = analysis
             
-            # Group keys by base layer
-            base_layers = defaultdict(list)
-            ranks_found = []
+            trigger_words = [f"{k}: {v}" for k, v in metadata.items() if any(w in k.lower() for w in ["trigger", "prompt", "keyword", "instance"])]
+            if trigger_words:
+                result["trigger_words"] = trigger_words
+            
+            result["file_size_mb"] = round(os.path.getsize(lora_path) / (1024 * 1024), 2)
+            
+            base_keys = set()
+            normalized_mapping = {}
+            target_layer_groups = defaultdict(list)
             
             for key in keys:
-                # Skip text encoder
-                if any(te in key for te in ["lora_te", "text_encoder", "text_model"]):
-                    analysis["text_encoder_keys"] += 1
+                if "alpha" in key or not any(x in key for x in ["lora_down", "lora_up", "lora_A", "lora_B"]):
                     continue
                 
-                analysis["unet_keys"] += 1
+                base = get_base_key(key)
+                if base in base_keys:
+                    continue
+                base_keys.add(base)
                 
-                # Extract base layer name
-                base_key = key
-                for suffix in [".lora_A.weight", ".lora_B.weight", ".lora_up.weight", 
-                             ".lora_down.weight", ".alpha"]:
-                    if base_key.endswith(suffix):
-                        base_key = base_key[:-len(suffix)]
-                        # Check rank
-                        if ("lora_down" in key or "lora_A" in key) and analysis["rank"] is None:
-                            tensor = f.get_tensor(key)
-                            ranks_found.append(min(tensor.shape))
-                        break
+                result["conversion_stats"]["total_pairs"] += 1
                 
-                base_layers[base_key].append(key)
+                # Check for T5 text encoder keys first (lora_te1). These are now convertible.
+                if base.startswith("lora_te1_"):
+                    result["conversion_stats"]["convertible_text_encoder_pairs"] += 1
+                    continue
                 
-                # Analyze layer type
-                normalized, target_type = normalize_lora_key_for_analysis(key)
-                analysis["target_types"][target_type] += 1
+                # Skip other TE keys (like CLIP/lora_te2) which are not used by Chroma
+                if any(te in base for te in ["text_encoder", "lora_te2", "te_"]):
+                    result["conversion_stats"]["will_skip_unsupported"] += 1
+                    continue
                 
-                # Track layer distribution
-                if "double_blocks" in normalized or "double_blocks" in key:
-                    analysis["layer_distribution"]["double_blocks"] += 1
-                elif "single_blocks" in normalized or "single_transformer_blocks" in normalized:
-                    analysis["layer_distribution"]["single_blocks"] += 1
+                normalized = normalize_lora_key(base)
+                
+                if normalized is None:
+                    result["conversion_stats"]["will_skip_unsupported"] += 1
+                elif is_modulation_layer(normalized):
+                    result["conversion_stats"]["will_skip_modulation"] += 1
                 else:
-                    analysis["layer_distribution"]["other"] += 1
+                    result["conversion_stats"]["convertible_unet_pairs"] += 1
+                    normalized_mapping[base] = normalized
+                    target_layer_groups[normalized].append(base)
             
-            # Auto-detect rank from most common
-            if ranks_found and analysis["rank"] is None:
-                from collections import Counter
-                rank_counts = Counter(ranks_found)
-                analysis["rank"] = rank_counts.most_common(1)[0][0]
+            result["conversion_stats"]["will_accumulate"] = sum(1 for sources in target_layer_groups.values() if len(sources) > 1)
             
-            # Count complete pairs and analyze convertibility
-            for base_key, related_keys in base_layers.items():
-                has_down = any("down" in k or "lora_A" in k for k in related_keys)
-                has_up = any("up" in k or "lora_B" in k for k in related_keys)
+            # --- Scoring and Recommendation Logic ---
+            conv_stats = result["conversion_stats"]
+            total_unet_pairs = conv_stats["convertible_unet_pairs"] + conv_stats["will_skip_modulation"] + conv_stats["will_skip_unsupported"]
+            
+            if conv_stats["convertible_unet_pairs"] > 0:
+                # Score is based on UNet conversion quality
+                conversion_rate = conv_stats["convertible_unet_pairs"] / total_unet_pairs if total_unet_pairs > 0 else 0
+                result["score"] = conversion_rate * 100
+                result["compatible"] = conversion_rate >= 0.5
+                result["recommendation"] = "✅ Good candidate for conversion."
+            elif conv_stats["convertible_text_encoder_pairs"] > 0:
+                # If only TE layers are present, it's 100% convertible
+                result["score"] = 100.0
+                result["compatible"] = True
+                result["recommendation"] = "✅ Good candidate for conversion (Text Encoder only)."
+            else:
+                result["score"] = 0.0
+                result["compatible"] = False
+                if conv_stats["total_pairs"] > 0:
+                    result["issues"].append("No convertible UNet or Text Encoder layers found.")
+                else:
+                    result["issues"].append("No valid LoRA pairs found in the file.")
+                result["recommendation"] = "❌ Not recommended for conversion."
+
+            # Add warnings based on what will be skipped
+            if conv_stats["will_skip_modulation"] > 0:
+                pct = conv_stats["will_skip_modulation"] / total_unet_pairs * 100 if total_unet_pairs > 0 else 0
+                result["warnings"].append(f"{pct:.0f}% of UNet layers are modulation (incompatible)")
+            
+            if conv_stats["will_skip_unsupported"] > 0:
+                pct = conv_stats["will_skip_unsupported"] / total_unet_pairs * 100 if total_unet_pairs > 0 else 0
+                result["warnings"].append(f"{pct:.0f}% of UNet layers are unsupported or non-T5 TE (will be skipped)")
+
+            # Find rank
+            for key in keys:
+                if ".lora_down.weight" in key or ".lora_A.weight" in key:
+                    result["rank"] = min(f.get_tensor(key).shape)
+                    break
                 
-                if has_down and has_up:
-                    analysis["convertible_stats"]["total_pairs"] += 1
-                    
-                    normalized, target_type = normalize_lora_key_for_analysis(base_key)
-                    
-                    # Check if it's modulation
-                    if target_type == "modulation":
-                        analysis["convertible_stats"]["will_skip_modulation"] += 1
-                    # Check if it's non-existent
-                    elif target_type in ["nonexistent_single_proj_out", "nonexistent_norm_linear"]:
-                        analysis["convertible_stats"]["will_skip_nonexistent"] += 1
-                    # Check if it will accumulate
-                    elif target_type in ["single_attention_qkv", "double_img_attention_qkv", 
-                                       "double_txt_attention_qkv"]:
-                        analysis["convertible_stats"]["will_accumulate"] += 1
-                        analysis["convertible_stats"]["convertible"] += 1
-                    else:
-                        analysis["convertible_stats"]["convertible"] += 1
-            
-            # Identify issues
-            if analysis["unet_keys"] == 0:
-                analysis["issues"].append("No UNet keys found - text encoder only LoRA")
-            
-            if analysis["convertible_stats"]["convertible"] == 0:
-                analysis["issues"].append("No convertible layer pairs found")
-            
-            # Add warnings
-            if analysis["convertible_stats"]["will_skip_nonexistent"] > 0:
-                pct = (analysis["convertible_stats"]["will_skip_nonexistent"] / 
-                      analysis["convertible_stats"]["total_pairs"] * 100)
-                analysis["warnings"].append(f"{pct:.1f}% of layers target non-existent Flux layers")
-            
-            if analysis["convertible_stats"]["will_skip_modulation"] > 0:
-                pct = (analysis["convertible_stats"]["will_skip_modulation"] / 
-                      analysis["convertible_stats"]["total_pairs"] * 100)
-                analysis["warnings"].append(f"{pct:.1f}% of layers are modulation (will be skipped)")
-            
     except Exception as e:
-        analysis["issues"].append(f"Error reading file: {str(e)}")
-        
-    return analysis
+        result["issues"].append(f"Error analyzing file: {str(e)}")
+        result["compatible"] = False
+        result["score"] = 0.0
+        result["recommendation"] = "❌ Error during analysis."
 
-def calculate_quality_score(analysis: Dict) -> Tuple[float, List[str]]:
-    """Calculate conversion quality score based on comprehensive analysis"""
-    
-    score = 100.0
-    factors = []
-    
-    # Check if UNet LoRA
-    if analysis["unet_keys"] == 0:
-        return 0.0, ["Text encoder only LoRA - cannot convert to Chroma"]
-    
-    # Check convertible layers
-    if analysis["convertible_stats"]["convertible"] == 0:
-        return 0.0, ["No convertible layer pairs found"]
-    
-    # Calculate conversion coverage
-    total_pairs = analysis["convertible_stats"]["total_pairs"]
-    convertible = analysis["convertible_stats"]["convertible"]
-    if total_pairs > 0:
-        coverage = convertible / total_pairs
-        if coverage < 0.5:
-            score -= 30
-            factors.append(f"Low conversion coverage ({coverage:.1%})")
-        elif coverage < 0.8:
-            score -= 15
-            factors.append(f"Moderate conversion coverage ({coverage:.1%})")
-        else:
-            factors.append(f"High conversion coverage ({coverage:.1%})")
-    
-    # File size analysis
-    if analysis["file_size_mb"] < 5:
-        score -= 20
-        factors.append(f"Very small file ({analysis['file_size_mb']:.1f}MB) - limited effect")
-    elif analysis["file_size_mb"] > 500:
-        score -= 10
-        factors.append(f"Large file ({analysis['file_size_mb']:.1f}MB) - may be slow to convert")
-    
-    # Naming style
-    if analysis["naming_style"] == "standard":
-        factors.append("Standard naming (optimal)")
-    elif analysis["naming_style"] in ["diffusers", "kohya"]:
-        factors.append(f"{analysis['naming_style'].capitalize()} naming (fully supported)")
-    else:
-        score -= 10
-        factors.append("Unknown naming format")
-    
-    # Layer distribution
-    has_double = analysis["layer_distribution"]["double_blocks"] > 0
-    has_single = analysis["layer_distribution"]["single_blocks"] > 0
-    
-    if has_double and has_single:
-        factors.append("Full model training (double + single blocks)")
-    elif has_single and not has_double:
-        score -= 10
-        factors.append("Single blocks only (partial training)")
-    elif has_double and not has_single:
-        score -= 15
-        factors.append("Double blocks only (limited training)")
-    
-    # Accumulation
-    if analysis["convertible_stats"]["will_accumulate"] > 0:
-        factors.append(f"{analysis['convertible_stats']['will_accumulate']} layers will use smart accumulation")
-    
-    # Non-existent layers
-    if analysis["convertible_stats"]["will_skip_nonexistent"] > 10:
-        score -= 20
-        factors.append(f"{analysis['convertible_stats']['will_skip_nonexistent']} layers target non-existent architecture")
-    
-    # Rank analysis
-    if analysis["rank"]:
-        if analysis["rank"] < 4:
-            score -= 20
-            factors.append(f"Very low rank ({analysis['rank']}) - minimal effect")
-        elif analysis["rank"] > 256:
-            score -= 10
-            factors.append(f"Very high rank ({analysis['rank']}) - may be slow")
-        else:
-            factors.append(f"Rank {analysis['rank']}")
-    
-    # Trigger words
-    if analysis["trigger_words"]:
-        factors.append(f"Has trigger: '{analysis['trigger_words'][:50]}'")
-    
-    score = max(0, min(100, score))
-    
-    return score, factors
+    return result
 
-def format_analysis_report(analysis: Dict, score: float, factors: List[str]) -> str:
-    """Format a comprehensive analysis report"""
-    
-    report = []
-    report.append(f"\n{'='*70}")
-    report.append(f"LoRA: {analysis['filename']}")
-    report.append(f"{'='*70}")
-    report.append(f"Conversion Quality Score: {score:.0f}%")
-    report.append(f"File Size: {analysis['file_size_mb']:.1f} MB")
-    report.append(f"Naming Style: {analysis['naming_style']}")
-    
-    if analysis["rank"]:
-        report.append(f"Rank: {analysis['rank']}")
-    
-    report.append(f"\nStructure Analysis:")
-    report.append(f"  Total keys: {analysis['total_keys']}")
-    report.append(f"  UNet keys: {analysis['unet_keys']}")
-    report.append(f"  Text encoder keys: {analysis['text_encoder_keys']}")
-    
-    report.append(f"\nConversion Statistics:")
-    stats = analysis["convertible_stats"]
-    report.append(f"  Total LoRA pairs: {stats['total_pairs']}")
-    report.append(f"  Convertible pairs: {stats['convertible']} ({stats['convertible']/stats['total_pairs']*100:.1f}%)" if stats['total_pairs'] > 0 else "  Convertible pairs: 0")
-    report.append(f"  Will accumulate: {stats['will_accumulate']}")
-    report.append(f"  Will skip (modulation): {stats['will_skip_modulation']}")
-    report.append(f"  Will skip (non-existent): {stats['will_skip_nonexistent']}")
-    
-    # Layer distribution
-    if analysis["layer_distribution"]:
-        report.append(f"\nLayer Distribution:")
-        for layer_type, count in analysis["layer_distribution"].items():
-            if count > 0:
-                report.append(f"  {layer_type}: {count} keys")
-    
-    # Target types breakdown
-    if len(analysis["target_types"]) > 1:
-        report.append(f"\nTarget Layer Types:")
-        sorted_types = sorted(analysis["target_types"].items(), key=lambda x: -x[1])
-        for target_type, count in sorted_types[:10]:
-            report.append(f"  {target_type}: {count}")
-    
-    if analysis["trigger_words"]:
-        report.append(f"\nTrigger Words: {analysis['trigger_words']}")
-    
-    report.append(f"\nQuality Factors:")
-    for factor in factors:
-        report.append(f"  • {factor}")
-    
-    if analysis["warnings"]:
-        report.append(f"\nWarnings:")
-        for warning in analysis["warnings"]:
-            report.append(f"  ⚠ {warning}")
-    
-    if analysis["issues"]:
-        report.append(f"\nIssues:")
-        for issue in analysis["issues"]:
-            report.append(f"  ❌ {issue}")
-    
-    # Recommendation
-    report.append(f"\nRecommendation:")
-    if score >= 90:
-        report.append("  ✅ Excellent for conversion - minimal information loss")
-    elif score >= 70:
-        report.append("  ✓ Good for conversion - should work well")
-    elif score >= 50:
-        report.append("  ⚡ Fair for conversion - will work with some limitations")
-    else:
-        report.append("  ❌ Poor for conversion - significant limitations expected")
-    
-    return "\n".join(report)
-
-def scan_directory(directory: str, min_score: float = 0.0) -> List[Tuple[Dict, float, List[str]]]:
-    """Scan directory for LoRA files and analyze them"""
-    
-    directory_path = Path(directory)
-    if not directory_path.exists():
-        raise ValueError(f"Directory does not exist: {directory}")
-    
-    lora_files = list(directory_path.glob("*.safetensors"))
-    
-    if not lora_files:
-        print(f"No .safetensors files found in {directory}")
-        return []
-    
-    print(f"\nFound {len(lora_files)} .safetensors files")
-    print("Analyzing compatibility...\n")
-    
+def scan_directory(directory: str, detailed: bool) -> List[Dict[str, Any]]:
+    """Scan directory for LoRA files and rank by compatibility"""
     results = []
     
-    for lora_file in lora_files:
-        try:
-            # Skip very large files (likely base models)
-            if lora_file.stat().st_size > 2 * 1024**3:  # 2GB
-                continue
-                
-            analysis = analyze_lora_structure(str(lora_file))
-            score, factors = calculate_quality_score(analysis)
-            
-            if score >= min_score:
-                results.append((analysis, score, factors))
-                
-        except Exception as e:
-            print(f"Error analyzing {lora_file.name}: {e}")
+    lora_files = [os.path.join(root, file) for root, _, files in os.walk(directory) for file in files if file.endswith('.safetensors')]
     
-    # Sort by score
-    results.sort(key=lambda x: x[1], reverse=True)
+    print(f"Found {len(lora_files)} LoRA files, analyzing...")
     
+    for lora_path in lora_files:
+        print(f"  -> Analyzing: {os.path.basename(lora_path)}")
+        result = check_single_lora_compatibility(lora_path, verbose=detailed)
+        results.append(result)
+    
+    results.sort(key=lambda x: x.get("score", 0), reverse=True)
     return results
 
-def print_summary(results: List[Tuple[Dict, float, List[str]]], top_n: int = 10):
-    """Print summary of scan results"""
+def format_compatibility_report(result: Dict[str, Any], detailed: bool = False) -> str:
+    """Format compatibility analysis as readable report"""
+    lines = ["="*70, f"LoRA: {os.path.basename(result['path'])}", "="*70]
     
-    print(f"\n{'='*80}")
-    print("COMPATIBILITY SCAN SUMMARY")
-    print(f"{'='*80}")
+    score = result.get("score", 0)
+    lines.append(f"Conversion Quality Score: {score:.1f}%")
+    lines.append(f"Recommendation: {result.get('recommendation', 'N/A')}")
+    lines.append(f"File Size: {result.get('file_size_mb', 0)} MB | Rank: {result.get('rank', 'N/A')} | Format: {result['stats'].get('format', 'unknown')}")
     
-    print(f"\nTotal LoRAs analyzed: {len(results)}")
-    
-    # Group by score ranges
-    excellent = sum(1 for _, score, _ in results if score >= 90)
-    good = sum(1 for _, score, _ in results if 70 <= score < 90)
-    fair = sum(1 for _, score, _ in results if 50 <= score < 70)
-    poor = sum(1 for _, score, _ in results if score < 50)
-    
-    print(f"\nScore Distribution:")
-    print(f"  Excellent (90-100%): {excellent}")
-    print(f"  Good (70-89%): {good}")
-    print(f"  Fair (50-69%): {fair}")
-    print(f"  Poor (0-49%): {poor}")
-    
-    # Show top results
-    print(f"\nTop {min(top_n, len(results))} LoRAs for Chroma conversion:")
-    print(f"{'Score':<8} {'Rank':<6} {'Style':<10} {'Coverage':<10} {'Size':<8} {'Filename'}")
-    print("-" * 80)
-    
-    for analysis, score, _ in results[:top_n]:
-        rank_str = str(analysis["rank"]) if analysis["rank"] else "?"
-        style = analysis["naming_style"][:10]
-        stats = analysis["convertible_stats"]
-        coverage = f"{stats['convertible']}/{stats['total_pairs']}" if stats['total_pairs'] > 0 else "0/0"
-        size = f"{analysis['file_size_mb']:.1f}MB"
+    conv_stats = result.get("conversion_stats", {})
+    total_pairs = conv_stats.get("total_pairs", 0)
+    if total_pairs > 0:
+        lines.append("\nConversion Potential:")
+        lines.append(f"  - Convertible UNet Pairs: {conv_stats['convertible_unet_pairs']} / {total_pairs}")
+        if conv_stats.get("convertible_text_encoder_pairs", 0) > 0:
+            lines.append(f"  - Handled Text Encoder Pairs: {conv_stats['convertible_text_encoder_pairs']}")
+        if conv_stats.get("will_accumulate", 0) > 0:
+            lines.append(f"  - UNet Layers to Accumulate: {conv_stats['will_accumulate']}")
         
-        print(f"{score:>6.0f}%  {rank_str:<6} {style:<10} {coverage:<10} {size:<8} {analysis['filename'][:35]}")
+        skipped_items = []
+        if conv_stats.get("will_skip_modulation", 0) > 0:
+            skipped_items.append(f"Modulation ({conv_stats['will_skip_modulation']})")
+        if conv_stats.get("will_skip_unsupported", 0) > 0:
+            skipped_items.append(f"Unsupported/Other ({conv_stats['will_skip_unsupported']})")
+        if skipped_items:
+            lines.append(f"  - Skipped Layers: " + ", ".join(skipped_items))
+
+    if detailed:
+        stats = result.get("stats", {})
+        lines.append("\nDetailed Structure:")
+        lines.append(f"  - Total Keys: {stats.get('total_keys', 0)} (UNet: {stats.get('unet_keys', 0)}, TE: {stats.get('text_encoder_keys', 0)})")
+        lines.append(f"  - Unique Modules: {stats.get('unique_base_keys', 0)}")
+        if stats.get("block_distribution"):
+            dist_str = ", ".join([f"{k.replace('_blocks', '')}: {v}" for k, v in stats["block_distribution"].items()])
+            lines.append(f"  - Block Distribution: {dist_str}")
+
+    if result.get("trigger_words"):
+        lines.append("\nTrigger Words Found:")
+        lines.extend([f"  - {trigger}" for trigger in result["trigger_words"]])
+    
+    if result.get("issues"):
+        lines.append("\nIssues:")
+        lines.extend([f"  - {issue}" for issue in result["issues"]])
+    
+    if result.get("warnings"):
+        lines.append("\nWarnings:")
+        lines.extend([f"  - {warning}" for warning in result["warnings"]])
+        
+    return "\n".join(lines)
 
 def main():
-    parser = argparse.ArgumentParser(description="Scan Flux LoRAs for Chroma compatibility v3")
-    
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--lora", type=str, help="Single LoRA file to analyze")
-    group.add_argument("--scan-dir", type=str, help="Directory to scan for LoRA files")
-    
-    parser.add_argument("--save-report", type=str, help="Save detailed report to file")
-    parser.add_argument("--top-n", type=int, default=10, help="Number of top results to show")
-    parser.add_argument("--min-score", type=float, default=0.0, help="Minimum score to include")
-    parser.add_argument("--json", action="store_true", help="Output analysis as JSON")
+    parser = argparse.ArgumentParser(description="Analyze Flux LoRA compatibility with Chroma (v6, for converter v15.0+)")
+    parser.add_argument("--lora", help="Path to single LoRA file to analyze")
+    parser.add_argument("--scan-dir", help="Directory to scan for LoRA files")
+    parser.add_argument("--min-score", type=float, help="Only output LoRAs with a compatibility score at or above this threshold (e.g., 70).")
+    parser.add_argument("--top-n", type=int, default=10, help="Number of top results to show when scanning. Ignored if --min-score is set.")
+    parser.add_argument("--save-report", help="Save detailed report to a text file")
+    parser.add_argument("--json", help="Save detailed report as a JSON file")
+    parser.add_argument("--detailed", action="store_true", help="Show more detailed analysis in the console report")
     
     args = parser.parse_args()
     
-    if args.lora:
-        # Single LoRA analysis
-        try:
-            analysis = analyze_lora_structure(args.lora)
-            score, factors = calculate_quality_score(analysis)
-            
-            if args.json:
-                output = {
-                    "analysis": analysis,
-                    "score": score,
-                    "factors": factors
-                }
-                # Convert defaultdicts to regular dicts for JSON
-                output["analysis"]["layer_distribution"] = dict(output["analysis"]["layer_distribution"])
-                output["analysis"]["target_types"] = dict(output["analysis"]["target_types"])
-                print(json.dumps(output, indent=2))
-            else:
-                report = format_analysis_report(analysis, score, factors)
-                print(report)
-            
-            if args.save_report and not args.json:
-                with open(args.save_report, 'w', encoding='utf-8') as f:
-                    f.write(report)
-                print(f"\nReport saved to: {args.save_report}")
-                
-        except Exception as e:
-            print(f"Error analyzing LoRA: {e}")
-            traceback.print_exc()
+    if not args.lora and not args.scan_dir:
+        parser.error("Either --lora or --scan-dir must be specified")
     
-    else:
-        # Directory scan
-        results = scan_directory(args.scan_dir, args.min_score)
+    if args.min_score is not None and not (0 <= args.min_score <= 100):
+        parser.error("--min-score must be between 0 and 100")
         
-        if results:
-            print_summary(results, args.top_n)
-            
-            if args.save_report:
-                with open(args.save_report, 'w', encoding='utf-8') as f:
-                    f.write(f"Flux to Chroma Compatibility Scan Report v3\n")
-                    f.write(f"Directory: {args.scan_dir}\n")
-                    f.write(f"Total LoRAs analyzed: {len(results)}\n")
-                    f.write("="*80 + "\n")
-                    
-                    for analysis, score, factors in results:
-                        report = format_analysis_report(analysis, score, factors)
-                        f.write(report + "\n")
-                
-                print(f"\nDetailed report saved to: {args.save_report}")
+    results = []
+    all_results = []
+
+    if args.lora:
+        results = [check_single_lora_compatibility(args.lora, verbose=args.detailed)]
+        all_results = results
+    else:
+        all_results = scan_directory(args.scan_dir, args.detailed)
+        if args.min_score is not None:
+            results = [res for res in all_results if res.get('score', 0) >= args.min_score]
+            print(f"\n--- Found {len(results)} of {len(all_results)} LoRAs with score >= {args.min_score}% ---")
         else:
-            print("No LoRA files found matching criteria.")
+            results = all_results[:args.top_n]
+            print(f"\n--- Top {len(results)} LoRA Compatibility Results ---")
+
+    # Output to console
+    for result in results:
+        print(format_compatibility_report(result, detailed=args.detailed))
+        print()
+    
+    # Save text report if requested
+    if args.save_report:
+        with open(args.save_report, "w", encoding="utf-8") as f:
+            f.write(f"Flux to Chroma LoRA Compatibility Report\n")
+            f.write(f"Scanned Directory: {os.path.abspath(args.scan_dir) if args.scan_dir else os.path.abspath(args.lora)}\n")
+            f.write(f"Total LoRAs Analyzed: {len(all_results)}\n")
+            f.write(f"Displaying {len(results)} results.\n\n")
+            for result in results:
+                f.write(format_compatibility_report(result, detailed=True))
+                f.write("\n\n")
+        print(f"Text report saved to: {args.save_report}")
+    
+    # Save JSON report if requested
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+        print(f"JSON report saved to: {args.json}")
+    
+    if not results or not results[0].get("compatible"):
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
