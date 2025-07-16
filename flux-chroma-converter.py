@@ -1,41 +1,28 @@
 #!/usr/bin/env python3
 """
-Flux Dev to Chroma LoRA Converter v15.0 - Final, Definitive, Evidence-Based Text Encoder Fix
+Flux Dev to Chroma LoRA Converter v17.0 - Realistic Text Encoder Handling
 
-This version implements the final and correct fix for Text Encoder (TE) key
-conversion, based on a rigorous, iterative analysis of ComfyUI error logs and
-established LoRA standards.
+This version adjusts its approach to Text Encoder (TE) conversion based on user
+feedback and evidence that the previously generated keys are not loaded correctly
+by ComfyUI. The "definitive fix" from v15/v16 was based on a sound theory but
+proven incorrect in practice.
 
-Background of Previous Failures:
-- v10-v12: These versions made incorrect assumptions about key shortening and
-  the mapping from underscore-based to dot-based hierarchies.
-- v13: This version correctly identified the need for structural renaming but
-  incorrectly retained the `text_model_` prefix from the original Diffusers
-  key, which does not exist in the standard T5 model loaded by ComfyUI. This
-  was confirmed by the v13 error logs.
-- v14: This version removed the `text_model_` prefix and converted keys to a
-  dot-separated format (e.g., `lora_te_encoder.block.0.layer.0.SelfAttention.q`).
-  This was based on the assumption that ComfyUI uses a standard dot-separated
-  hierarchy for all keys. However, the "lora key not loaded" errors persisted,
-  proving this assumption was also incorrect.
-
-The Definitive Fix (v15.0):
-The key insight, drawn from further analysis of ComfyUI error logs and
-community issue trackers, is that the T5 Text Encoder LoRA keys expected by
-ComfyUI are much closer to the original Diffusers format than previously thought.
-The complex remapping to a dot-separated hierarchy was unnecessary and incorrect.
-
-The correct transformation is a simple prefix replacement:
-1.  The prefix `lora_te1_text_model_` is replaced with `lora_te_`.
-2.  The rest of the key's structure is *preserved* in its original,
-    underscore-separated format.
-
-Example Transformation:
-- Source: `lora_te1_text_model_encoder_layers_0_self_attn_q_proj.lora_up.weight`
-- Target: `lora_te_encoder_layers_0_self_attn_q_proj.lora_up.weight`
-
-This produces the exact key format that ComfyUI's LoRA loader expects,
-resolving the "lora key not loaded" errors once and for all.
+Evidence-Based Change Justification:
+-   **Problem:** Despite mapping `lora_te1_` keys to the `lora_te_` prefix,
+    users report that ComfyUI still fails to load these keys.
+-   **Conclusion:** The exact key format expected by ComfyUI for T5 LoRAs is
+    still unknown or unsupported. Generating these keys provides no value and
+    can be misleading.
+-   **Solution (v17.0):**
+    1.  **Safety First:** Text encoder conversion is now **disabled by default**.
+        The script will focus on the high-fidelity UNet conversion, which is
+        known to work correctly.
+    2.  **Experimental Opt-In:** The TE conversion logic is retained but is now
+        only activated by an explicit `--enable-text-encoder-conversion` flag.
+        This allows for future testing without misleading users by default.
+    3.  **Clarity:** The `--skip-text-encoder` flag has been removed to avoid
+        confusion. All logging and documentation have been updated to reflect
+        the experimental and likely non-functional state of TE conversion.
 """
 
 import argparse
@@ -74,7 +61,9 @@ logger = logging.getLogger(__name__)
 # Global debug flag
 DEBUG_MODE = False
 
-# Comprehensive key mapping based on actual Flux architecture
+# Comprehensive key mapping based on actual Flux architecture.
+# Mappings to `None` are intentional for layers that exist in full Diffusers
+# models but are absent in pruned versions like `flux1-dev-pruned`.
 DIFFUSERS_KEY_MAPPING = {
     # Single blocks - Flux only has linear1, linear2, and norm layers
     r"single_transformer_blocks\.(\d+)\.attn\.to_q": "single_blocks.{}.linear1",
@@ -85,7 +74,8 @@ DIFFUSERS_KEY_MAPPING = {
     r"single_transformer_blocks\.(\d+)\.ff\.net\.2": "single_blocks.{}.linear2",
     r"single_transformer_blocks\.(\d+)\.proj_mlp": "single_blocks.{}.linear1", # proj_mlp is an alias for ff.net.0.proj
     r"single_transformer_blocks\.(\d+)\.proj_out": "single_blocks.{}.linear2",
-    r"single_transformer_blocks\.(\d+)\.norm\.linear": None,  # Skip - doesn't exist in Flux base models like flux1-dev
+    # This layer does not exist in flux1-dev-pruned, so we explicitly skip it.
+    r"single_transformer_blocks\.(\d+)\.norm\.linear": None,
 
     # Double blocks (transformer_blocks without 'single')
     r"transformer_blocks\.(\d+)\.attn\.to_q": "double_blocks.{}.img_attn.qkv",
@@ -103,9 +93,9 @@ DIFFUSERS_KEY_MAPPING = {
     r"transformer_blocks\.(\d+)\.attn_context\.to_v": "double_blocks.{}.txt_attn.qkv",
     r"transformer_blocks\.(\d+)\.attn_context\.to_out\.0": "double_blocks.{}.txt_attn.proj",
     
-    # Handle norm layers for double blocks - these don't exist in flux-dev, so skip them.
-    r"transformer_blocks\.(\d+)\.norm1\.linear": None, # Skip - doesn't exist in flux1-dev, causes warnings
-    r"transformer_blocks\.(\d+)\.norm1_context\.linear": None, # Skip - doesn't exist in flux1-dev, causes warnings
+    # These norm layers do not exist in flux1-dev-pruned, so we explicitly skip them.
+    r"transformer_blocks\.(\d+)\.norm1\.linear": None,
+    r"transformer_blocks\.(\d+)\.norm1_context\.linear": None,
     
     # Diffusers-specific attention layers (these are aliases for the above, handled by the merger)
     r"transformer_blocks\.(\d+)\.attn\.add_q_proj": "double_blocks.{}.img_attn.qkv",
@@ -113,7 +103,7 @@ DIFFUSERS_KEY_MAPPING = {
     r"transformer_blocks\.(\d+)\.attn\.add_v_proj": "double_blocks.{}.img_attn.qkv",
     r"transformer_blocks\.(\d+)\.attn\.to_add_out": "double_blocks.{}.img_attn.proj",
     
-    # General text encoder patterns (skip these)
+    # General text encoder patterns (skip these from UNet processing)
     r"text_encoder.*": None,
     r"te_.*": None,
     r"lora_te.*": None,
@@ -126,8 +116,8 @@ DIFFUSERS_KEY_MAPPING = {
 # Additional direct mappings for edge cases
 DIRECT_KEY_MAPPING = {
     # These are exact replacements, not patterns
-    "transformer.proj_out": None,  # Skip - doesn't exist
-    "transformer.norm_out.linear": None,  # Skip - doesn't exist
+    "transformer.proj_out": None,
+    "transformer.norm_out.linear": None,
 }
 
 # Known shape mappings for Flux/Chroma
@@ -273,7 +263,10 @@ def normalize_lora_key(key: str) -> Optional[str]:
     return key
 
 def is_modulation_layer(key: str) -> bool:
-    """Check if a key is a modulation layer (exists in Flux but not Chroma)"""
+    """
+    Check if a key is a modulation layer. These layers often exist in full
+    Flux models but not in Chroma, so they must be skipped.
+    """
     modulation_keywords = [
         "_mod.", ".mod.", "_mod_", ".modulation.",
         "mod_out", "norm_out", "scale_shift",
@@ -320,22 +313,24 @@ def analyze_lora_compatibility(lora_path: str) -> Dict[str, Any]:
     analysis = {
         "total_pairs": 0,
         "compatible_pairs": 0,
-        "incompatible_pairs": 0,
-        "skipped_pairs": 0,
+        "incompatible_modulation_pairs": 0,
+        "skipped_nonexistent_pairs": 0,
+        "skipped_unmapped_pairs": 0,
         "text_encoder_pairs": 0,
         "naming_style": "unknown",
         "rank": 16,
-        "convertible_pairs": [],
-        "unconvertible_pairs": [],
-        "skipped_pairs_list": []
+        "convertible_list": [],
+        "incompatible_modulation_list": [],
+        "skipped_nonexistent_list": [],
+        "skipped_unmapped_list": [],
     }
     
     try:
         rank, naming_style = detect_lora_rank(lora_path)
         analysis["rank"] = rank
         analysis["naming_style"] = naming_style
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not auto-detect rank/style: {e}")
     
     with safe_open(lora_path, framework="pt", device="cpu") as f:
         keys = list(f.keys())
@@ -360,25 +355,43 @@ def analyze_lora_compatibility(lora_path: str) -> Dict[str, Any]:
                 continue
                 
             processed_bases.add(base_key)
-            analysis["total_pairs"] += 1
             
             # Check if it's a text encoder key
             if any(base_key.startswith(prefix) for prefix in ['lora_te', 'text_encoder', 'te_']):
                 analysis["text_encoder_pairs"] += 1
                 continue
 
+            analysis["total_pairs"] += 1
+            
             # Check if convertible
             normalized_key = normalize_lora_key(base_key)
             
             if normalized_key is None:
-                analysis["skipped_pairs"] += 1
-                analysis["skipped_pairs_list"].append(base_key)
+                # Check if it was skipped because it's a known non-existent layer
+                is_nonexistent = False
+                temp_key = base_key
+                # Strip prefixes to match the mapping dict
+                if temp_key.startswith('unet.'): temp_key = temp_key[5:]
+                elif temp_key.startswith('transformer.'): temp_key = temp_key[12:]
+
+                for pattern, replacement in DIFFUSERS_KEY_MAPPING.items():
+                    if replacement is None and re.match(pattern, temp_key):
+                        is_nonexistent = True
+                        break
+                
+                if is_nonexistent:
+                    analysis["skipped_nonexistent_pairs"] += 1
+                    analysis["skipped_nonexistent_list"].append(base_key)
+                else:
+                    analysis["skipped_unmapped_pairs"] += 1
+                    analysis["skipped_unmapped_list"].append(base_key)
+
             elif is_modulation_layer(normalized_key):
-                analysis["incompatible_pairs"] += 1
-                analysis["unconvertible_pairs"].append(base_key)
+                analysis["incompatible_modulation_pairs"] += 1
+                analysis["incompatible_modulation_list"].append(base_key)
             else:
                 analysis["compatible_pairs"] += 1
-                analysis["convertible_pairs"].append(base_key)
+                analysis["convertible_list"].append(base_key)
     
     return analysis
 
@@ -402,14 +415,13 @@ def load_lora_metadata(lora_path: str) -> Dict[str, str]:
 
 def convert_text_encoder_weights(lora_path: str) -> Dict[str, torch.Tensor]:
     """
-    Opens a LoRA file and converts text encoder-related keys for ComfyUI compatibility.
-    This is the definitive, evidence-based fix (v15.0).
+    (EXPERIMENTAL) Opens a LoRA file and converts text encoder-related keys.
+    WARNING: This conversion is known to fail in current ComfyUI versions.
+    Use the --enable-text-encoder-conversion flag to attempt it.
     """
-    logger.info("Converting text encoder weights for ComfyUI compatibility...")
+    logger.warning("Attempting EXPERIMENTAL conversion of text encoder weights...")
     te_weights = {}
     
-    # The key insight from ComfyUI error logs is that a complex remapping is wrong.
-    # The required transformation is a simple prefix swap.
     source_prefix = "lora_te1_text_model_"
     target_prefix = "lora_te_"
 
@@ -434,7 +446,7 @@ def convert_text_encoder_weights(lora_path: str) -> Dict[str, torch.Tensor]:
             logger.info(f"Found {len(te1_keys)} `lora_te1_` (T5) keys to convert.")
             
             converted_count = 0
-            for key in tqdm(te1_keys, desc="Converting T5 TE weights"):
+            for key in tqdm(te1_keys, desc="Converting T5 TE weights (Experimental)"):
                 # Perform the simple prefix replacement.
                 new_key = target_prefix + key[len(source_prefix):]
                 
@@ -523,7 +535,7 @@ class FluxLoRAApplier:
                     target_tensor_key = f"{target_key}.weight"
 
                     if target_tensor_key not in base_keys_available:
-                        logger.warning(f"Skipping group for target {target_key}: tensor {target_tensor_key} not in base model.")
+                        logger.warning(f"Skipping group for target {target_key}: tensor {target_tensor_key} not in base model. This is expected for pruned models.")
                         skipped_count += len(source_keys)
                         continue
 
@@ -951,36 +963,48 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
     logger.info("Analyzing LoRA compatibility...")
     compatibility = analyze_lora_compatibility(flux_lora_path)
     
-    logger.info("\nLoRA Analysis:")
-    logger.info(f"  Naming style: {compatibility['naming_style']}")
-    logger.info(f"  Total pairs: {compatibility['total_pairs']}")
-    logger.info(f"  - UNet Convertible: {compatibility['compatible_pairs']}")
-    logger.info(f"  - UNet Incompatible (Modulation): {compatibility['incompatible_pairs']}")
-    logger.info(f"  - Text Encoder (will be converted): {compatibility['text_encoder_pairs']}")
-    
+    logger.info("\n" + "="*25 + " LoRA Analysis Report " + "="*25)
+    logger.info(f"LoRA File: {Path(flux_lora_path).name}")
+    logger.info(f"  Naming Style Detected: {compatibility['naming_style']}")
+    logger.info(f"  UNet Rank Detected: {compatibility['rank']}")
+    logger.info("-" * 72)
+    logger.info(f"  Total UNet Pairs Found: {compatibility['total_pairs']}")
+    logger.info(f"    - ✅ Convertible to Chroma: {compatibility['compatible_pairs']}")
+    logger.info(f"    - ⚠️ Skipped (Layer Not in Pruned Base Model): {compatibility['skipped_nonexistent_pairs']}")
+    logger.info(f"    - ❌ Skipped (Incompatible Modulation Layer): {compatibility['incompatible_modulation_pairs']}")
+    logger.info(f"    - ❓ Skipped (Unrecognized/Unmappable Key): {compatibility['skipped_unmapped_pairs']}")
+    logger.info("-" * 72)
+    logger.info(f"  Total Text Encoder Pairs Found: {compatibility['text_encoder_pairs']}")
+    if args.enable_text_encoder_conversion:
+        logger.warning("  (Conversion will be ATTEMPTED for TE pairs - this is experimental and may not work in ComfyUI)")
+    else:
+        logger.info("  (TE pairs will be SKIPPED by default. Use --enable-text-encoder-conversion to attempt conversion)")
+    logger.info("="*72 + "\n")
+
     if DEBUG_MODE:
-        if compatibility['convertible_pairs']:
-            logger.debug(f"Sample convertible keys: {compatibility['convertible_pairs'][:3]}")
-        if compatibility['unconvertible_pairs']:
-            logger.debug(f"Sample unconvertible keys: {compatibility['unconvertible_pairs'][:3]}")
-    
+        if compatibility['convertible_list']:
+            logger.debug(f"Sample convertible keys: {compatibility['convertible_list'][:3]}")
+        if compatibility['skipped_nonexistent_list']:
+            logger.debug(f"Sample non-existent keys skipped: {compatibility['skipped_nonexistent_list'][:3]}")
+        if compatibility['incompatible_modulation_list']:
+            logger.debug(f"Sample incompatible keys: {compatibility['incompatible_modulation_list'][:3]}")
+
     if compatibility['compatible_pairs'] == 0:
-        logger.error("ERROR: No compatible UNet LoRA pairs found!")
-        if compatibility['text_encoder_pairs'] > 0 and not args.skip_text_encoder:
-             logger.warning("This LoRA appears to be text-encoder only. A new LoRA will be created with only text-encoder weights.")
+        if compatibility['text_encoder_pairs'] > 0 and args.enable_text_encoder_conversion:
+             logger.warning("This LoRA appears to be text-encoder only. Attempting experimental TE-only conversion.")
         else:
-            logger.error("This LoRA cannot be converted to Chroma format.")
+            logger.error("CONVERSION HALTED: No compatible UNet LoRA pairs found. This LoRA cannot be converted to Chroma format.")
             return 1
     
     if args.analyze_only:
-        logger.info(f"Analysis for {Path(flux_lora_path).name} complete.")
+        logger.info(f"Analysis for {Path(flux_lora_path).name} complete. Halting as requested by --analyze-only.")
         return 0
     
     # Use a local copy of rank to avoid modifying args
     rank = args.rank
     if rank == -1:
         rank = compatibility['rank']
-        logger.info(f"Auto-detected rank from UNet: {rank}")
+        logger.info(f"Using auto-detected UNet rank for extraction: {rank}")
     
     temp_dir = None # define in outer scope for cleanup in except block
     try:
@@ -1066,12 +1090,12 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
         logger.info("\n" + "="*60)
         logger.info("Step 5: Handling Text Encoder Weights...")
         logger.info("="*60)
-        if not args.skip_text_encoder:
+        if args.enable_text_encoder_conversion:
             te_weights = convert_text_encoder_weights(flux_lora_path)
             if te_weights:
                 final_lora_dict.update(te_weights)
         else:
-            logger.info("Skipping text encoder weight conversion as requested.")
+            logger.info("Skipping text encoder weight conversion. Use --enable-text-encoder-conversion to override.")
 
         if not final_lora_dict:
             logger.error("Conversion failed: The final LoRA dictionary is empty. No UNet or TE weights were processed.")
@@ -1090,9 +1114,9 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
         metadata["chroma_extraction_rank"] = str(rank)
         metadata["flux_lora_applied_count"] = str(applied_count)
         metadata["chroma_conversion_date"] = datetime.now().isoformat()
-        metadata["chroma_converter_version"] = "v15.0"
+        metadata["chroma_converter_version"] = "v17.0"
         metadata["original_naming_style"] = compatibility['naming_style']
-        metadata["text_encoder_weights_copied"] = str(not args.skip_text_encoder)
+        metadata["text_encoder_conversion_attempted"] = str(args.enable_text_encoder_conversion)
         metadata["accumulated_layers"] = str(len(merge_stats.get("accumulated", [])))
         
         logger.info(f"Saving final LoRA with {len(metadata)} metadata entries...")
@@ -1110,15 +1134,16 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
                 else:
                     logger.warning("No metadata found in saved file")
         
-        logger.info("\n" + "="*60)
-        logger.info("Conversion complete!")
-        logger.info(f"Output: {output_lora_path}")
-        logger.info(f"Extracted {unet_pairs} UNet LoRA triplets with rank {rank}")
-        if not args.skip_text_encoder:
-            logger.info(f"Converted {te_pairs} Text Encoder LoRA triplets.")
-        logger.info(f"Original naming style: {compatibility['naming_style']}")
-        logger.info(f"Accumulated {len(merge_stats.get('accumulated', []))} multi-component UNet layers")
-        logger.info("="*60)
+        logger.info("\n" + "="*24 + " Conversion Complete! " + "="*24)
+        logger.info(f"Output File: {output_lora_path}")
+        logger.info(f"  - Extracted {unet_pairs} UNet LoRA modules with rank {rank}")
+        if args.enable_text_encoder_conversion:
+            logger.info(f"  - Attempted to convert {te_pairs} Text Encoder LoRA modules (Experimental).")
+        else:
+            logger.info("  - Text Encoder modules were not converted (default).")
+        logger.info(f"  - Original LoRA naming style: {compatibility['naming_style']}")
+        logger.info(f"  - Accumulated {len(merge_stats.get('accumulated', []))} multi-component UNet layers")
+        logger.info("="*72)
         
         logger.info("Cleaning up temporary files...")
         if temp_dir is not None and temp_dir.exists():
@@ -1139,7 +1164,7 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Flux Dev to Chroma LoRA Converter v15.0 - Final, Definitive, Evidence-Based Text Encoder Fix',
+        description='Flux Dev to Chroma LoRA Converter v17.0 - Realistic Text Encoder Handling',
         formatter_class=argparse.RawTextHelpFormatter
     )
     # Required base models
@@ -1170,7 +1195,7 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable detailed debug logging')
     parser.add_argument('--analyze-only', action='store_true', help='Only analyze LoRA compatibility without converting')
     parser.add_argument('--skip-validation', action='store_true', help='Skip the final LoRA validation step')
-    parser.add_argument('--skip-text-encoder', action='store_true', help='Do not convert text encoder weights from the source LoRA. (Default: convert them)')
+    parser.add_argument('--enable-text-encoder-conversion', action='store_true', help='(EXPERIMENTAL) Attempt to convert text encoder weights. This is known to fail in current ComfyUI versions.')
     
     args = parser.parse_args()
     
@@ -1238,3 +1263,48 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+    
+    #
+# --- Historical Note on Text Encoder Conversion Attempts ---
+# The conversion of T5 text encoder weights (`lora_te1_...`) has proven to be
+# a significant challenge. The following methods were attempted and ultimately
+# failed, leading to the current "experimental, opt-in" status. This history
+# is preserved to prevent repeating failed experiments.
+#
+#   -   **v10-v12:** These early versions made incorrect assumptions about key
+#       shortening and the general mapping from an underscore-based to a
+#       dot-based hierarchy. They failed broadly.
+#
+#   -   **v13:** This version correctly identified the need for structural
+#       renaming but made a critical error: it retained the `text_model_`
+#       prefix from the original Diffusers key. Error logs from ComfyUI
+#       confirmed that the T5 model it loads does not have this prefix, so
+#       the keys were not found.
+#
+#   -   **v14:** Based on the v13 failure, this version correctly removed the
+#       `text_model_` prefix. However, it then incorrectly converted the
+#       entire key to a standard dot-separated hierarchy (e.g.,
+#       `lora_te_encoder.block.0.layer.0.SelfAttention.q`). This was based on
+#       the assumption that ComfyUI uses a standard dot-separated hierarchy
+#       for all LoRA keys. The "lora key not loaded" errors persisted,
+#       proving this assumption was also incorrect for the T5 encoder.
+#
+#   -   **v15/v16 (The "Definitive Fix" Attempt):** This was the most
+#       promising and evidence-based attempt. After further analysis of
+#       ComfyUI's source and error logs, it was determined that the expected
+#       key format was much closer to the Diffusers original. This version
+#       performed a simple prefix replacement:
+#
+#       -   Source: `lora_te1_text_model_encoder_layers_0_self_attn_q_proj.lora_up.weight`
+#       -   Target: `lora_te_encoder_layers_0_self_attn_q_proj.lora_up.weight`
+#
+#       This preserved the original underscore-separated format while using the
+#       `lora_te_` prefix expected by ComfyUI's loader. While this seemed
+#       theoretically perfect and matched all available evidence, in-practice
+#       user feedback confirmed that ComfyUI *still* failed to load these keys.
+#
+#   -   **v17 (Current):** Given the repeated failures, the conclusion is that
+#       the exact key format is either still unknown or that ComfyUI's T5 LoRA
+#       loading mechanism has a bug or an undocumented requirement. To prevent
+#       generating non-functional LoRAs, TE conversion was made an
+#       experimental, opt-in feature.
