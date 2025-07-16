@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Flux to Chroma LoRA Compatibility Scanner v6
+Flux to Chroma LoRA Compatibility Scanner v7
 Analyzes Flux LoRAs for Chroma conversion compatibility.
-Aligned with converter v15.0, which correctly handles Text Encoder keys.
-Includes option to filter by minimum compatibility score.
+Aligned with converter v17.0, which treats Text Encoder conversion as
+experimental and disabled by default. The score is now based purely on UNet
+compatibility.
 """
 
 import argparse
@@ -16,7 +17,7 @@ import re
 from collections import defaultdict, Counter
 import json
 
-# Key mapping patterns - ALIGNED WITH CONVERTER v15.0 for consistency
+# Key mapping patterns - ALIGNED WITH CONVERTER v17.0 for consistency
 DIFFUSERS_KEY_MAPPING = {
     # Single blocks - Flux only has linear1, linear2, and norm layers
     r"single_transformer_blocks\.(\d+)\.attn\.to_q": "single_blocks.{}.linear1",
@@ -199,9 +200,9 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
         "warnings": [],
         "stats": {},
         "conversion_stats": {
-            "total_pairs": 0,
+            "total_unet_pairs": 0,
             "convertible_unet_pairs": 0,
-            "convertible_text_encoder_pairs": 0,
+            "experimental_text_encoder_pairs": 0,
             "will_accumulate": 0,
             "will_skip_modulation": 0,
             "will_skip_unsupported": 0,
@@ -226,6 +227,9 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
             normalized_mapping = {}
             target_layer_groups = defaultdict(list)
             
+            # Count total pairs first
+            total_pairs = len({get_base_key(k) for k in keys if not k.endswith('.alpha')})
+
             for key in keys:
                 if "alpha" in key or not any(x in key for x in ["lora_down", "lora_up", "lora_A", "lora_B"]):
                     continue
@@ -235,11 +239,9 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
                     continue
                 base_keys.add(base)
                 
-                result["conversion_stats"]["total_pairs"] += 1
-                
-                # Check for T5 text encoder keys first (lora_te1). These are now convertible.
+                # Check for T5 text encoder keys first (lora_te1). These are now experimental.
                 if base.startswith("lora_te1_"):
-                    result["conversion_stats"]["convertible_text_encoder_pairs"] += 1
+                    result["conversion_stats"]["experimental_text_encoder_pairs"] += 1
                     continue
                 
                 # Skip other TE keys (like CLIP/lora_te2) which are not used by Chroma
@@ -247,6 +249,8 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
                     result["conversion_stats"]["will_skip_unsupported"] += 1
                     continue
                 
+                # This is a UNet key
+                result["conversion_stats"]["total_unet_pairs"] += 1
                 normalized = normalize_lora_key(base)
                 
                 if normalized is None:
@@ -262,27 +266,29 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
             
             # --- Scoring and Recommendation Logic ---
             conv_stats = result["conversion_stats"]
-            total_unet_pairs = conv_stats["convertible_unet_pairs"] + conv_stats["will_skip_modulation"] + conv_stats["will_skip_unsupported"]
+            total_unet_pairs = conv_stats["total_unet_pairs"]
             
-            if conv_stats["convertible_unet_pairs"] > 0:
-                # Score is based on UNet conversion quality
-                conversion_rate = conv_stats["convertible_unet_pairs"] / total_unet_pairs if total_unet_pairs > 0 else 0
+            if total_unet_pairs > 0:
+                # Score is based purely on UNet conversion quality
+                conversion_rate = conv_stats["convertible_unet_pairs"] / total_unet_pairs
                 result["score"] = conversion_rate * 100
                 result["compatible"] = conversion_rate >= 0.5
-                result["recommendation"] = "✅ Good candidate for conversion."
-            elif conv_stats["convertible_text_encoder_pairs"] > 0:
-                # If only TE layers are present, it's 100% convertible
-                result["score"] = 100.0
-                result["compatible"] = True
-                result["recommendation"] = "✅ Good candidate for conversion (Text Encoder only)."
+                if conversion_rate >= 0.7:
+                    result["recommendation"] = "✅ Good candidate for conversion."
+                elif conversion_rate >= 0.5:
+                    result["recommendation"] = "⚠️ Fair candidate. May have partial effect."
+                else:
+                    result["recommendation"] = "❌ Poor candidate. Most of the LoRA will be lost."
             else:
+                # No UNet layers found
                 result["score"] = 0.0
                 result["compatible"] = False
-                if conv_stats["total_pairs"] > 0:
-                    result["issues"].append("No convertible UNet or Text Encoder layers found.")
+                if conv_stats["experimental_text_encoder_pairs"] > 0:
+                    result["recommendation"] = "❌ Not recommended (Text Encoder only, conversion is experimental and likely to fail)."
+                    result["issues"].append("This appears to be a Text Encoder-only LoRA.")
                 else:
-                    result["issues"].append("No valid LoRA pairs found in the file.")
-                result["recommendation"] = "❌ Not recommended for conversion."
+                    result["recommendation"] = "❌ Not recommended for conversion."
+                    result["issues"].append("No convertible UNet or Text Encoder layers found.")
 
             # Add warnings based on what will be skipped
             if conv_stats["will_skip_modulation"] > 0:
@@ -328,27 +334,29 @@ def format_compatibility_report(result: Dict[str, Any], detailed: bool = False) 
     lines = ["="*70, f"LoRA: {os.path.basename(result['path'])}", "="*70]
     
     score = result.get("score", 0)
-    lines.append(f"Conversion Quality Score: {score:.1f}%")
+    lines.append(f"UNet Compatibility Score: {score:.1f}%")
     lines.append(f"Recommendation: {result.get('recommendation', 'N/A')}")
     lines.append(f"File Size: {result.get('file_size_mb', 0)} MB | Rank: {result.get('rank', 'N/A')} | Format: {result['stats'].get('format', 'unknown')}")
     
     conv_stats = result.get("conversion_stats", {})
-    total_pairs = conv_stats.get("total_pairs", 0)
-    if total_pairs > 0:
-        lines.append("\nConversion Potential:")
-        lines.append(f"  - Convertible UNet Pairs: {conv_stats['convertible_unet_pairs']} / {total_pairs}")
-        if conv_stats.get("convertible_text_encoder_pairs", 0) > 0:
-            lines.append(f"  - Handled Text Encoder Pairs: {conv_stats['convertible_text_encoder_pairs']}")
+    total_unet_pairs = conv_stats.get("total_unet_pairs", 0)
+    if total_unet_pairs > 0:
+        lines.append("\nUNet Conversion Potential:")
+        lines.append(f"  - Convertible Pairs: {conv_stats['convertible_unet_pairs']} / {total_unet_pairs}")
         if conv_stats.get("will_accumulate", 0) > 0:
-            lines.append(f"  - UNet Layers to Accumulate: {conv_stats['will_accumulate']}")
+            lines.append(f"  - Layers to Accumulate: {conv_stats['will_accumulate']}")
         
         skipped_items = []
         if conv_stats.get("will_skip_modulation", 0) > 0:
             skipped_items.append(f"Modulation ({conv_stats['will_skip_modulation']})")
         if conv_stats.get("will_skip_unsupported", 0) > 0:
-            skipped_items.append(f"Unsupported/Other ({conv_stats['will_skip_unsupported']})")
+            skipped_items.append(f"Unsupported ({conv_stats['will_skip_unsupported']})")
         if skipped_items:
-            lines.append(f"  - Skipped Layers: " + ", ".join(skipped_items))
+            lines.append(f"  - Skipped Pairs: " + ", ".join(skipped_items))
+
+    if conv_stats.get("experimental_text_encoder_pairs", 0) > 0:
+        lines.append("\nText Encoder:")
+        lines.append(f"  - Experimental T5 TE Pairs: {conv_stats['experimental_text_encoder_pairs']} (Conversion is opt-in and may fail)")
 
     if detailed:
         stats = result.get("stats", {})
@@ -374,7 +382,7 @@ def format_compatibility_report(result: Dict[str, Any], detailed: bool = False) 
     return "\n".join(lines)
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Flux LoRA compatibility with Chroma (v6, for converter v15.0+)")
+    parser = argparse.ArgumentParser(description="Analyze Flux LoRA compatibility with Chroma (v7, for converter v17.0+)")
     parser.add_argument("--lora", help="Path to single LoRA file to analyze")
     parser.add_argument("--scan-dir", help="Directory to scan for LoRA files")
     parser.add_argument("--min-score", type=float, help="Only output LoRAs with a compatibility score at or above this threshold (e.g., 70).")
