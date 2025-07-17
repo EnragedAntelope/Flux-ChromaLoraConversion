@@ -1,10 +1,32 @@
 #!/usr/bin/env python3
 """
-Flux to Chroma LoRA Compatibility Scanner v7
+Flux to Chroma LoRA Compatibility Scanner v10
+
 Analyzes Flux LoRAs for Chroma conversion compatibility.
-Aligned with converter v17.0, which treats Text Encoder conversion as
-experimental and disabled by default. The score is now based purely on UNet
-compatibility.
+This version is fully aligned with the logic of `flux-chroma-converter.py` v17.9,
+ensuring its analysis and scoring are highly accurate and predictive of the
+actual conversion outcome.
+
+Evidence-Based Change Justification (v10):
+-   **Problem:** The previous scanner (v9) used an outdated `normalize_lora_key`
+    function that did not correctly handle structural LoRA keys (e.g.,
+    `lora_unet_single_blocks_0_linear1`). It failed to transform them into the
+    hybrid `single_blocks.0.linear1` format required by the base models.
+-   **Evidence:** A direct comparison between the scanner's normalization logic and
+    the converter's v17.9 logic showed a critical divergence. The converter
+    correctly handles the hybrid underscore/dot naming convention, while the
+    scanner did not, leading to inaccurate analysis.
+-   **Solution:**
+    1.  The `DIFFUSERS_KEY_MAPPING` and `DIRECT_KEY_MAPPING` dictionaries have been
+        updated to be exact copies of those in the v17.9 converter.
+    2.  The `normalize_lora_key` function has been completely replaced with the
+        definitive, evidence-based version from the v17.9 converter. This new
+        function correctly transforms keys like `single_blocks_0_linear1` into
+        `single_blocks.0.linear1`.
+-   **Result:** The scanner now uses the identical analysis engine as the converter,
+    making its compatibility scores and recommendations a reliable and precise
+    preview of the conversion process for all LoRA types, including semantic
+    and structural LoRAs.
 """
 
 import argparse
@@ -17,46 +39,48 @@ import re
 from collections import defaultdict, Counter
 import json
 
-# Key mapping patterns - ALIGNED WITH CONVERTER v17.0 for consistency
+# --- Key Mappings - ALIGNED WITH CONVERTER v17.9 ---
+# Flexible regex patterns to accept either '.' or '_' as separators between ALL components.
 DIFFUSERS_KEY_MAPPING = {
     # Single blocks - Flux only has linear1, linear2, and norm layers
-    r"single_transformer_blocks\.(\d+)\.attn\.to_q": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.attn\.to_k": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.attn\.to_v": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.attn\.to_out\.0": "single_blocks.{}.linear2",
-    r"single_transformer_blocks\.(\d+)\.ff\.net\.0\.proj": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.ff\.net\.2": "single_blocks.{}.linear2",
-    r"single_transformer_blocks\.(\d+)\.proj_mlp": "single_blocks.{}.linear1", # Alias for ff.net.0.proj
-    r"single_transformer_blocks\.(\d+)\.proj_out": "single_blocks.{}.linear2",
-    r"single_transformer_blocks\.(\d+)\.norm\.linear": None,  # Skip - doesn't exist in flux1-dev
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_q": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_k": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_v": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_out[._]0": "single_blocks.{}.linear2",
+    r"single_transformer_blocks[._](\d+)[._]ff[._]net[._]0[._]proj": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]ff[._]net[._]2": "single_blocks.{}.linear2",
+    r"single_transformer_blocks[._](\d+)[._]proj_mlp": "single_blocks.{}.linear1", # proj_mlp is an alias for ff.net.0.proj
+    r"single_transformer_blocks[._](\d+)[._]proj_out": "single_blocks.{}.linear2",
+    # This layer does not exist in flux1-dev-pruned, so we explicitly skip it.
+    r"single_transformer_blocks[._](\d+)[._]norm[._]linear": None,
 
     # Double blocks (transformer_blocks without 'single')
-    r"transformer_blocks\.(\d+)\.attn\.to_q": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_k": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_v": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_out\.0": "double_blocks.{}.img_attn.proj",
-    r"transformer_blocks\.(\d+)\.ff\.net\.0\.proj": "double_blocks.{}.img_mlp.0",
-    r"transformer_blocks\.(\d+)\.ff\.net\.2": "double_blocks.{}.img_mlp.2",
-    r"transformer_blocks\.(\d+)\.ff_context\.net\.0\.proj": "double_blocks.{}.txt_mlp.0",
-    r"transformer_blocks\.(\d+)\.ff_context\.net\.2": "double_blocks.{}.txt_mlp.2",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_q": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_k": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_v": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_out[._]0": "double_blocks.{}.img_attn.proj",
+    r"transformer_blocks[._](\d+)[._]ff[._]net[._]0[._]proj": "double_blocks.{}.img_mlp.0",
+    r"transformer_blocks[._](\d+)[._]ff[._]net[._]2": "double_blocks.{}.img_mlp.2",
+    r"transformer_blocks[._](\d+)[._]ff_context[._]net[._]0[._]proj": "double_blocks.{}.txt_mlp.0",
+    r"transformer_blocks[._](\d+)[._]ff_context[._]net[._]2": "double_blocks.{}.txt_mlp.2",
     
     # Context attention for double blocks
-    r"transformer_blocks\.(\d+)\.attn_context\.to_q": "double_blocks.{}.txt_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn_context\.to_k": "double_blocks.{}.txt_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn_context\.to_v": "double_blocks.{}.txt_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn_context\.to_out\.0": "double_blocks.{}.txt_attn.proj",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_q": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_k": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_v": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_out[._]0": "double_blocks.{}.txt_attn.proj",
     
-    # Handle norm layers for double blocks - these don't exist in flux-dev, so skip them.
-    r"transformer_blocks\.(\d+)\.norm1\.linear": None, # Skip - doesn't exist in flux1-dev
-    r"transformer_blocks\.(\d+)\.norm1_context\.linear": None, # Skip - doesn't exist in flux1-dev
+    # These norm layers do not exist in flux1-dev-pruned, so we explicitly skip them.
+    r"transformer_blocks[._](\d+)[._]norm1[._]linear": None,
+    r"transformer_blocks[._](\d+)[._]norm1_context[._]linear": None,
     
     # Diffusers-specific attention layers (these are aliases for the above, handled by the merger)
-    r"transformer_blocks\.(\d+)\.attn\.add_q_proj": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.add_k_proj": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.add_v_proj": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_add_out": "double_blocks.{}.img_attn.proj",
+    r"transformer_blocks[._](\d+)[._]attn[._]add_q_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]add_k_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]add_v_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_add_out": "double_blocks.{}.img_attn.proj",
     
-    # General text encoder patterns (skip these from UNet normalization)
+    # General text encoder patterns (skip these from UNet processing)
     r"text_encoder.*": None,
     r"te_.*": None,
     r"lora_te.*": None,
@@ -66,56 +90,86 @@ DIFFUSERS_KEY_MAPPING = {
     r"unet\.label_emb.*": None,
 }
 
-# Additional direct mappings for edge cases
 DIRECT_KEY_MAPPING = {
-    # These are exact replacements, not patterns
-    "transformer.proj_out": None,  # Skip - doesn't exist
-    "transformer.norm_out.linear": None,  # Skip - doesn't exist
+    # These are exact replacements, not patterns.
+    # They are mapped to `None` because they exist in the full, non-pruned Diffusers
+    # Flux model but are ABSENT in the `flux1-dev-pruned.safetensors` model.
+    # Skipping them is the correct action for compatibility with the pruned model.
+    "proj.out": None,
+    "norm.out.linear": None,
+    "context.embedder": None,
+    "x.embedder": None,
+    "time.text.embed.guidance.embedder.linear.1": None,
+    "time.text.embed.guidance.embedder.linear.2": None,
+    "time.text.embed.text.embedder.linear.1": None,
+    "time.text.embed.text.embedder.linear.2": None,
+    "time.text.embed.timestep.embedder.linear.1": None,
+    "time.text.embed.timestep.embedder.linear.2": None,
 }
 
 def normalize_lora_key(key: str) -> Optional[str]:
     """
-    Normalize a LoRA key to match Flux structure.
+    Normalize a LoRA key from various formats (semantic Diffusers, structural Kohya)
+    to the dot-separated format used by the Chroma base model.
+    Returns None if the key should be skipped.
     This function is an exact copy of the one in the converter for consistency.
     """
     original_key = key
     
-    # Remove .lora_A.weight, .lora_B.weight suffixes
+    # Step 1: Clean up suffixes and alpha values.
     key = re.sub(r'\.lora_[AB]\.weight$', '', key)
     key = re.sub(r'\.lora_(up|down)\.weight$', '', key)
     key = re.sub(r'\.alpha$', '', key)
     
-    # Remove prefix if present
-    if key.startswith('lora_unet_'):
-        # This logic handles pre-normalized keys but the converter is more robust
-        key = key[len('lora_unet_'):].replace('_', '.')
-        return key
-    elif any(key.startswith(prefix) for prefix in ['lora_te', 'text_encoder', 'te_', 'lora_te1', 'lora_te2']):
-        return None  # Skip text encoder from UNet normalization
-    elif key.startswith('unet.'):
-        key = key[5:]
-    elif key.startswith('transformer.'):
-        key = key[12:]
-    elif key.startswith('model.'):
-        key = key[6:]
-    elif key.startswith('diffusion_model.'):
-        key = key[16:]
-    
-    # Check direct mappings first
-    if key in DIRECT_KEY_MAPPING:
-        return DIRECT_KEY_MAPPING[key]
-    
-    # Try pattern-based mappings
+    # Step 2: Skip all text encoder keys. They are not part of the UNet.
+    if any(key.startswith(prefix) for prefix in ['lora_te', 'text_encoder', 'te_', 'lora_te1', 'lora_te2']):
+        return None
+
+    # Step 3: Strip all known UNet prefixes to get the "core" key.
+    core_key = key
+    prefixes_to_strip = [
+        'lora_unet_', 'lora_transformer_', 'unet.', 'transformer.', 
+        'model.', 'diffusion_model.'
+    ]
+    for prefix in prefixes_to_strip:
+        if core_key.startswith(prefix):
+            core_key = core_key[len(prefix):]
+            break
+
+    # Step 4: Attempt to match the core key against the SEMANTIC patterns first.
+    # This handles standard LoRAs that need their components (q, k, v, etc.) mapped to fused layers.
     for pattern, replacement in DIFFUSERS_KEY_MAPPING.items():
-        match = re.match(pattern, key)
+        match = re.match(pattern, core_key)
         if match:
             if replacement is None:
                 return None
             else:
                 return replacement.format(*match.groups())
+
+    # --- DEFINITIVE FIX (Step 4.5) ---
+    # If no semantic pattern matched, it's likely a structural key (e.g., 'single_blocks_0_linear1').
+    # We must convert it to the hybrid `single_blocks.0.linear1` format.
+    if core_key.startswith('single_blocks_'):
+        prefix = 'single_blocks'
+        rest_of_key = core_key[len(prefix)+1:] # +1 to skip the first underscore
+        rest_of_key_dotted = rest_of_key.replace('_', '.')
+        final_key = f"{prefix}.{rest_of_key_dotted}"
+        return final_key
     
-    # If no mapping found, return the key as-is for the analyzer to classify
-    return key
+    if core_key.startswith('double_blocks_'):
+        prefix = 'double_blocks'
+        rest_of_key = core_key[len(prefix)+1:] # +1 to skip the first underscore
+        rest_of_key_dotted = rest_of_key.replace('_', '.')
+        final_key = f"{prefix}.{rest_of_key_dotted}"
+        return final_key
+
+    # Step 5: If no pattern matched, check against the direct, non-block mappings.
+    direct_check_key = core_key.replace('_', '.')
+    if direct_check_key in DIRECT_KEY_MAPPING:
+        return DIRECT_KEY_MAPPING[direct_check_key]
+
+    # If no mapping was found at all, return the unmapped key for analysis.
+    return core_key
 
 def is_modulation_layer(key: str) -> bool:
     """Check if a key is a true modulation layer (exists in Flux but not Chroma)"""
@@ -175,6 +229,7 @@ def analyze_lora_keys(keys: List[str]) -> Dict[str, Any]:
             base_keys.add(base)
     
     for base in base_keys:
+        # Use original separators for analysis before normalization
         if "attn" in base:
             analysis["layer_types"]["attention"] += 1
         elif "ff" in base or "mlp" in base:
@@ -182,9 +237,9 @@ def analyze_lora_keys(keys: List[str]) -> Dict[str, Any]:
         elif "norm" in base:
             analysis["layer_types"]["normalization"] += 1
         
-        if "single_transformer_blocks" in base:
+        if "single_transformer_blocks" in base or "single_blocks" in base:
             analysis["block_distribution"]["single_blocks"] += 1
-        elif "transformer_blocks" in base:
+        elif "transformer_blocks" in base or "double_blocks" in base:
             analysis["block_distribution"]["double_blocks"] += 1
             
     analysis["unique_base_keys"] = len(base_keys)
@@ -206,6 +261,8 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
             "will_accumulate": 0,
             "will_skip_modulation": 0,
             "will_skip_unsupported": 0,
+            "will_skip_nonexistent": 0,
+            "will_skip_unmapped": 0,
         }
     }
     
@@ -224,12 +281,8 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
             result["file_size_mb"] = round(os.path.getsize(lora_path) / (1024 * 1024), 2)
             
             base_keys = set()
-            normalized_mapping = {}
             target_layer_groups = defaultdict(list)
             
-            # Count total pairs first
-            total_pairs = len({get_base_key(k) for k in keys if not k.endswith('.alpha')})
-
             for key in keys:
                 if "alpha" in key or not any(x in key for x in ["lora_down", "lora_up", "lora_A", "lora_B"]):
                     continue
@@ -254,13 +307,14 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
                 normalized = normalize_lora_key(base)
                 
                 if normalized is None:
-                    result["conversion_stats"]["will_skip_unsupported"] += 1
+                    result["conversion_stats"]["will_skip_nonexistent"] += 1
                 elif is_modulation_layer(normalized):
                     result["conversion_stats"]["will_skip_modulation"] += 1
-                else:
+                elif normalized and normalized.startswith(('single_blocks', 'double_blocks')):
                     result["conversion_stats"]["convertible_unet_pairs"] += 1
-                    normalized_mapping[base] = normalized
                     target_layer_groups[normalized].append(base)
+                else:
+                    result["conversion_stats"]["will_skip_unmapped"] += 1
             
             result["conversion_stats"]["will_accumulate"] = sum(1 for sources in target_layer_groups.values() if len(sources) > 1)
             
@@ -273,7 +327,9 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
                 conversion_rate = conv_stats["convertible_unet_pairs"] / total_unet_pairs
                 result["score"] = conversion_rate * 100
                 result["compatible"] = conversion_rate >= 0.5
-                if conversion_rate >= 0.7:
+                if conversion_rate >= 0.9:
+                    result["recommendation"] = "✅ Excellent candidate for conversion."
+                elif conversion_rate >= 0.7:
                     result["recommendation"] = "✅ Good candidate for conversion."
                 elif conversion_rate >= 0.5:
                     result["recommendation"] = "⚠️ Fair candidate. May have partial effect."
@@ -292,18 +348,20 @@ def check_single_lora_compatibility(lora_path: str, verbose: bool = False) -> Di
 
             # Add warnings based on what will be skipped
             if conv_stats["will_skip_modulation"] > 0:
-                pct = conv_stats["will_skip_modulation"] / total_unet_pairs * 100 if total_unet_pairs > 0 else 0
-                result["warnings"].append(f"{pct:.0f}% of UNet layers are modulation (incompatible)")
-            
+                result["warnings"].append(f"{conv_stats['will_skip_modulation']} modulation layers will be skipped (incompatible)")
+            if conv_stats["will_skip_nonexistent"] > 0:
+                result["warnings"].append(f"{conv_stats['will_skip_nonexistent']} layers will be skipped (not in pruned base model)")
+            if conv_stats["will_skip_unmapped"] > 0:
+                result["warnings"].append(f"{conv_stats['will_skip_unmapped']} layers will be skipped (unrecognized key format)")
             if conv_stats["will_skip_unsupported"] > 0:
-                pct = conv_stats["will_skip_unsupported"] / total_unet_pairs * 100 if total_unet_pairs > 0 else 0
-                result["warnings"].append(f"{pct:.0f}% of UNet layers are unsupported or non-T5 TE (will be skipped)")
+                result["warnings"].append(f"{conv_stats['will_skip_unsupported']} non-T5 TE layers will be skipped")
 
             # Find rank
             for key in keys:
                 if ".lora_down.weight" in key or ".lora_A.weight" in key:
-                    result["rank"] = min(f.get_tensor(key).shape)
-                    break
+                    if not any(te in key for te in ["text_encoder", "lora_te", "te_"]): # Only check UNet rank
+                        result["rank"] = min(f.get_tensor(key).shape)
+                        break
                 
     except Exception as e:
         result["issues"].append(f"Error analyzing file: {str(e)}")
@@ -336,7 +394,7 @@ def format_compatibility_report(result: Dict[str, Any], detailed: bool = False) 
     score = result.get("score", 0)
     lines.append(f"UNet Compatibility Score: {score:.1f}%")
     lines.append(f"Recommendation: {result.get('recommendation', 'N/A')}")
-    lines.append(f"File Size: {result.get('file_size_mb', 0)} MB | Rank: {result.get('rank', 'N/A')} | Format: {result['stats'].get('format', 'unknown')}")
+    lines.append(f"File Size: {result.get('file_size_mb', 0)} MB | UNet Rank: {result.get('rank', 'N/A')} | Format: {result['stats'].get('format', 'unknown')}")
     
     conv_stats = result.get("conversion_stats", {})
     total_unet_pairs = conv_stats.get("total_unet_pairs", 0)
@@ -349,14 +407,20 @@ def format_compatibility_report(result: Dict[str, Any], detailed: bool = False) 
         skipped_items = []
         if conv_stats.get("will_skip_modulation", 0) > 0:
             skipped_items.append(f"Modulation ({conv_stats['will_skip_modulation']})")
-        if conv_stats.get("will_skip_unsupported", 0) > 0:
-            skipped_items.append(f"Unsupported ({conv_stats['will_skip_unsupported']})")
+        if conv_stats.get("will_skip_nonexistent", 0) > 0:
+            skipped_items.append(f"Non-existent ({conv_stats['will_skip_nonexistent']})")
+        if conv_stats.get("will_skip_unmapped", 0) > 0:
+            skipped_items.append(f"Unmapped ({conv_stats['will_skip_unmapped']})")
+        
         if skipped_items:
-            lines.append(f"  - Skipped Pairs: " + ", ".join(skipped_items))
+            lines.append(f"  - Skipped UNet Pairs: " + ", ".join(skipped_items))
 
-    if conv_stats.get("experimental_text_encoder_pairs", 0) > 0:
+    if conv_stats.get("experimental_text_encoder_pairs", 0) > 0 or conv_stats.get("will_skip_unsupported", 0) > 0:
         lines.append("\nText Encoder:")
-        lines.append(f"  - Experimental T5 TE Pairs: {conv_stats['experimental_text_encoder_pairs']} (Conversion is opt-in and may fail)")
+        if conv_stats.get("experimental_text_encoder_pairs", 0) > 0:
+            lines.append(f"  - Experimental T5 TE Pairs: {conv_stats['experimental_text_encoder_pairs']} (Conversion is opt-in and may fail)")
+        if conv_stats.get("will_skip_unsupported", 0) > 0:
+            lines.append(f"  - Skipped Unsupported TE Pairs: {conv_stats['will_skip_unsupported']} (e.g., CLIP/TE2)")
 
     if detailed:
         stats = result.get("stats", {})
@@ -382,7 +446,7 @@ def format_compatibility_report(result: Dict[str, Any], detailed: bool = False) 
     return "\n".join(lines)
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Flux LoRA compatibility with Chroma (v7, for converter v17.0+)")
+    parser = argparse.ArgumentParser(description="Analyze Flux LoRA compatibility with Chroma (v10, for converter v17.9+)")
     parser.add_argument("--lora", help="Path to single LoRA file to analyze")
     parser.add_argument("--scan-dir", help="Directory to scan for LoRA files")
     parser.add_argument("--min-score", type=float, help="Only output LoRAs with a compatibility score at or above this threshold (e.g., 70).")
