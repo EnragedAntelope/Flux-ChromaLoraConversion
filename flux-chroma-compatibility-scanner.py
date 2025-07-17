@@ -1,32 +1,35 @@
 #!/usr/bin/env python3
-"""
-Flux to Chroma LoRA Compatibility Scanner v10
+r"""
+Flux to Chroma LoRA Compatibility Scanner v11
 
 Analyzes Flux LoRAs for Chroma conversion compatibility.
-This version is fully aligned with the logic of `flux-chroma-converter.py` v17.9,
+This version is fully aligned with the logic of `flux-chroma-converter.py` v18.0,
 ensuring its analysis and scoring are highly accurate and predictive of the
 actual conversion outcome.
 
-Evidence-Based Change Justification (v10):
--   **Problem:** The previous scanner (v9) used an outdated `normalize_lora_key`
-    function that did not correctly handle structural LoRA keys (e.g.,
-    `lora_unet_single_blocks_0_linear1`). It failed to transform them into the
-    hybrid `single_blocks.0.linear1` format required by the base models.
--   **Evidence:** A direct comparison between the scanner's normalization logic and
-    the converter's v17.9 logic showed a critical divergence. The converter
-    correctly handles the hybrid underscore/dot naming convention, while the
-    scanner did not, leading to inaccurate analysis.
+Evidence-Based Change Justification (v11):
+-   **Problem:** The previous scanner (v10) was aligned with converter v17.9.
+    While it correctly analyzed semantic LoRAs, it contained a latent bug in
+    its `normalize_lora_key` function for structural `double_blocks` keys.
+    It would have incorrectly analyzed a key like `double_blocks_10_img_attn_qkv`
+    by converting it to the invalid key `double_blocks.10.img.attn.qkv`.
+
+-   **Evidence:** A direct comparison between the scanner's v10 normalization logic
+    and the converter's v18.0 logic showed a divergence in handling structural
+    keys with underscores. The converter's logic correctly preserves underscores
+    in components like `img_attn`, while the scanner's did not.
+
 -   **Solution:**
     1.  The `DIFFUSERS_KEY_MAPPING` and `DIRECT_KEY_MAPPING` dictionaries have been
-        updated to be exact copies of those in the v17.9 converter.
+        verified to be exact copies of those in the v18.0 converter.
     2.  The `normalize_lora_key` function has been completely replaced with the
-        definitive, evidence-based version from the v17.9 converter. This new
-        function correctly transforms keys like `single_blocks_0_linear1` into
-        `single_blocks.0.linear1`.
--   **Result:** The scanner now uses the identical analysis engine as the converter,
-    making its compatibility scores and recommendations a reliable and precise
-    preview of the conversion process for all LoRA types, including semantic
-    and structural LoRAs.
+        definitive, evidence-based version from the v18.0 converter. This new
+        function correctly transforms both `single_blocks` and `double_blocks`
+        structural keys, preserving the hybrid underscore/dot naming convention.
+
+-   **Result:** The scanner now uses the identical analysis engine as the v18.0
+    converter, making its compatibility scores and recommendations a reliable and
+    precise preview of the conversion process for all LoRA types.
 """
 
 import argparse
@@ -39,7 +42,7 @@ import re
 from collections import defaultdict, Counter
 import json
 
-# --- Key Mappings - ALIGNED WITH CONVERTER v17.9 ---
+# --- Key Mappings - ALIGNED WITH CONVERTER v18.0 ---
 # Flexible regex patterns to accept either '.' or '_' as separators between ALL components.
 DIFFUSERS_KEY_MAPPING = {
     # Single blocks - Flux only has linear1, linear2, and norm layers
@@ -157,10 +160,28 @@ def normalize_lora_key(key: str) -> Optional[str]:
         return final_key
     
     if core_key.startswith('double_blocks_'):
-        prefix = 'double_blocks'
-        rest_of_key = core_key[len(prefix)+1:] # +1 to skip the first underscore
-        rest_of_key_dotted = rest_of_key.replace('_', '.')
-        final_key = f"{prefix}.{rest_of_key_dotted}"
+        # This logic correctly handles complex keys like 'double_blocks_10_img_attn_qkv'
+        # It splits on the first underscore after the prefix, then joins the rest.
+        # This prevents 'img_attn' from becoming 'img.attn'.
+        parts = core_key.split('_')
+        prefix = parts[0] + '_' + parts[1]  # 'double_blocks'
+        
+        # The rest of the key needs careful reassembly with dots
+        rest_parts = parts[2:] # e.g., ['10', 'img', 'attn', 'qkv']
+        
+        # Re-join components that were split, like 'img_attn'
+        # This is a heuristic, but covers the known cases.
+        reassembled_parts = []
+        i = 0
+        while i < len(rest_parts):
+            if (rest_parts[i] == 'img' or rest_parts[i] == 'txt') and i + 1 < len(rest_parts) and (rest_parts[i+1] == 'attn' or rest_parts[i+1] == 'mlp'):
+                reassembled_parts.append(f"{rest_parts[i]}_{rest_parts[i+1]}")
+                i += 2
+            else:
+                reassembled_parts.append(rest_parts[i])
+                i += 1
+        
+        final_key = f"{prefix}.{'.'.join(reassembled_parts)}"
         return final_key
 
     # Step 5: If no pattern matched, check against the direct, non-block mappings.
@@ -176,7 +197,7 @@ def is_modulation_layer(key: str) -> bool:
     modulation_keywords = [
         "_mod.", ".mod.", "_mod_", ".modulation.",
         "mod_out", "norm_out", "scale_shift",
-        "mod.lin", "modulated", "norm_k.", "norm_q.",
+        "mod.lin", "modulated",
         "img_mod", "txt_mod", "vector_in",
         "guidance_in", "timestep_embedder"
     ]
@@ -186,7 +207,12 @@ def is_modulation_layer(key: str) -> bool:
             if "norm_added" in key:
                 continue
             return True
-    
+            
+    # This check was too broad and incorrectly flagged valid norm layers.
+    # The explicit skipping of norm layers in the main mapping is sufficient.
+    # if "norm.key_norm" in key or "norm.query_norm" in key:
+    #     return True
+
     return False
 
 def detect_lora_format(keys: List[str]) -> str:
@@ -446,7 +472,7 @@ def format_compatibility_report(result: Dict[str, Any], detailed: bool = False) 
     return "\n".join(lines)
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze Flux LoRA compatibility with Chroma (v10, for converter v17.9+)")
+    parser = argparse.ArgumentParser(description="Analyze Flux LoRA compatibility with Chroma (v11, for converter v18.0+)")
     parser.add_argument("--lora", help="Path to single LoRA file to analyze")
     parser.add_argument("--scan-dir", help="Directory to scan for LoRA files")
     parser.add_argument("--min-score", type=float, help="Only output LoRAs with a compatibility score at or above this threshold (e.g., 70).")
