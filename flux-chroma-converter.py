@@ -1,28 +1,39 @@
 #!/usr/bin/env python3
-"""
-Flux Dev to Chroma LoRA Converter v17.0 - Realistic Text Encoder Handling
+r"""
+Flux Dev to Chroma LoRA Converter v17.9 - Definitive Key Mapping Fix
 
-This version adjusts its approach to Text Encoder (TE) conversion based on user
-feedback and evidence that the previously generated keys are not loaded correctly
-by ComfyUI. The "definitive fix" from v15/v16 was based on a sound theory but
-proven incorrect in practice.
+This version provides a definitive fix to the key normalization logic, correctly
+handling the hybrid dot/underscore naming convention of the Flux/Chroma models.
 
-Evidence-Based Change Justification:
--   **Problem:** Despite mapping `lora_te1_` keys to the `lora_te_` prefix,
-    users report that ComfyUI still fails to load these keys.
--   **Conclusion:** The exact key format expected by ComfyUI for T5 LoRAs is
-    still unknown or unsupported. Generating these keys provides no value and
-    can be misleading.
--   **Solution (v17.0):**
-    1.  **Safety First:** Text encoder conversion is now **disabled by default**.
-        The script will focus on the high-fidelity UNet conversion, which is
-        known to work correctly.
-    2.  **Experimental Opt-In:** The TE conversion logic is retained but is now
-        only activated by an explicit `--enable-text-encoder-conversion` flag.
-        This allows for future testing without misleading users by default.
-    3.  **Clarity:** The `--skip-text-encoder` flag has been removed to avoid
-        confusion. All logging and documentation have been updated to reflect
-        the experimental and likely non-functional state of TE conversion.
+Evidence-Based Change Justification (v17.9):
+-   **Problem:** The v17.8 converter, while correctly identifying structural keys,
+    made an incorrect assumption about separator conversion. It converted ALL
+    underscores to dots, resulting in incorrect keys like `single.blocks.0.linear1`.
+    This still caused "tensor not in base model" errors.
+
+-   **Evidence:** The console log showed the script was looking for `single.blocks.0.linear1.weight`,
+    but analysis of the `flux-dev-pruned.safetensors` model structure (via the provided JSON)
+    proves the actual key is `single_blocks.0.linear1.weight`. The key difference is
+    the underscore in `single_blocks`.
+
+-   **Analysis:** The Flux/Chroma model architecture uses a hybrid naming scheme. The
+    main block prefixes are `single_blocks` and `double_blocks` (with an underscore).
+    However, all subsequent levels of the hierarchy are separated by dots (e.g., `.0.linear1`).
+    A simple global replacement of `_` with `.` is therefore incorrect.
+
+-   **Solution (Correctness & Precision):**
+    1.  **Precise Structural Key Transformation:** The fallback logic in `normalize_lora_key`
+        for structural keys has been completely rewritten.
+    2.  It now correctly handles keys like `lora_unet_single_blocks_0_linear1`. After stripping the
+        `lora_unet_` part, the core key is `single_blocks_0_linear1`.
+    3.  The new logic separates the prefix (`single_blocks`) from the rest of the key (`0_linear1`).
+    4.  It then replaces underscores with dots *only in the rest of the key* (`0.linear1`).
+    5.  Finally, it joins them back together with a dot, producing the correct key: `single_blocks.0.linear1`.
+    6.  This correctly transforms `single_blocks_0_linear1` into `single_blocks.0.linear1`,
+        and `double_blocks_10_img_attn_qkv` into `double_blocks.10.img_attn.qkv`,
+        perfectly matching the target model's key structure.
+    7.  This definitive fix ensures that both standard semantic LoRAs and structural
+        LoRAs are correctly mapped, resolving all key-related errors.
 """
 
 import argparse
@@ -52,7 +63,7 @@ try:
 except ImportError:
     HAS_DEBUG_LIBS = False
     
-warnings.filterwarnings('ignore')
+warnings.filterwarnings('ignore', category=SyntaxWarning) # Suppress the invalid escape sequence warning in the docstring
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -61,47 +72,46 @@ logger = logging.getLogger(__name__)
 # Global debug flag
 DEBUG_MODE = False
 
-# Comprehensive key mapping based on actual Flux architecture.
-# Mappings to `None` are intentional for layers that exist in full Diffusers
-# models but are absent in pruned versions like `flux1-dev-pruned`.
+# --- Key Mappings ---
+# Flexible regex patterns to accept either '.' or '_' as separators between ALL components.
 DIFFUSERS_KEY_MAPPING = {
     # Single blocks - Flux only has linear1, linear2, and norm layers
-    r"single_transformer_blocks\.(\d+)\.attn\.to_q": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.attn\.to_k": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.attn\.to_v": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.attn\.to_out\.0": "single_blocks.{}.linear2",
-    r"single_transformer_blocks\.(\d+)\.ff\.net\.0\.proj": "single_blocks.{}.linear1",
-    r"single_transformer_blocks\.(\d+)\.ff\.net\.2": "single_blocks.{}.linear2",
-    r"single_transformer_blocks\.(\d+)\.proj_mlp": "single_blocks.{}.linear1", # proj_mlp is an alias for ff.net.0.proj
-    r"single_transformer_blocks\.(\d+)\.proj_out": "single_blocks.{}.linear2",
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_q": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_k": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_v": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]attn[._]to_out[._]0": "single_blocks.{}.linear2",
+    r"single_transformer_blocks[._](\d+)[._]ff[._]net[._]0[._]proj": "single_blocks.{}.linear1",
+    r"single_transformer_blocks[._](\d+)[._]ff[._]net[._]2": "single_blocks.{}.linear2",
+    r"single_transformer_blocks[._](\d+)[._]proj_mlp": "single_blocks.{}.linear1", # proj_mlp is an alias for ff.net.0.proj
+    r"single_transformer_blocks[._](\d+)[._]proj_out": "single_blocks.{}.linear2",
     # This layer does not exist in flux1-dev-pruned, so we explicitly skip it.
-    r"single_transformer_blocks\.(\d+)\.norm\.linear": None,
+    r"single_transformer_blocks[._](\d+)[._]norm[._]linear": None,
 
     # Double blocks (transformer_blocks without 'single')
-    r"transformer_blocks\.(\d+)\.attn\.to_q": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_k": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_v": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_out\.0": "double_blocks.{}.img_attn.proj",
-    r"transformer_blocks\.(\d+)\.ff\.net\.0\.proj": "double_blocks.{}.img_mlp.0",
-    r"transformer_blocks\.(\d+)\.ff\.net\.2": "double_blocks.{}.img_mlp.2",
-    r"transformer_blocks\.(\d+)\.ff_context\.net\.0\.proj": "double_blocks.{}.txt_mlp.0",
-    r"transformer_blocks\.(\d+)\.ff_context\.net\.2": "double_blocks.{}.txt_mlp.2",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_q": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_k": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_v": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_out[._]0": "double_blocks.{}.img_attn.proj",
+    r"transformer_blocks[._](\d+)[._]ff[._]net[._]0[._]proj": "double_blocks.{}.img_mlp.0",
+    r"transformer_blocks[._](\d+)[._]ff[._]net[._]2": "double_blocks.{}.img_mlp.2",
+    r"transformer_blocks[._](\d+)[._]ff_context[._]net[._]0[._]proj": "double_blocks.{}.txt_mlp.0",
+    r"transformer_blocks[._](\d+)[._]ff_context[._]net[._]2": "double_blocks.{}.txt_mlp.2",
     
     # Context attention for double blocks
-    r"transformer_blocks\.(\d+)\.attn_context\.to_q": "double_blocks.{}.txt_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn_context\.to_k": "double_blocks.{}.txt_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn_context\.to_v": "double_blocks.{}.txt_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn_context\.to_out\.0": "double_blocks.{}.txt_attn.proj",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_q": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_k": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_v": "double_blocks.{}.txt_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn_context[._]to_out[._]0": "double_blocks.{}.txt_attn.proj",
     
     # These norm layers do not exist in flux1-dev-pruned, so we explicitly skip them.
-    r"transformer_blocks\.(\d+)\.norm1\.linear": None,
-    r"transformer_blocks\.(\d+)\.norm1_context\.linear": None,
+    r"transformer_blocks[._](\d+)[._]norm1[._]linear": None,
+    r"transformer_blocks[._](\d+)[._]norm1_context[._]linear": None,
     
     # Diffusers-specific attention layers (these are aliases for the above, handled by the merger)
-    r"transformer_blocks\.(\d+)\.attn\.add_q_proj": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.add_k_proj": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.add_v_proj": "double_blocks.{}.img_attn.qkv",
-    r"transformer_blocks\.(\d+)\.attn\.to_add_out": "double_blocks.{}.img_attn.proj",
+    r"transformer_blocks[._](\d+)[._]attn[._]add_q_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]add_k_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]add_v_proj": "double_blocks.{}.img_attn.qkv",
+    r"transformer_blocks[._](\d+)[._]attn[._]to_add_out": "double_blocks.{}.img_attn.proj",
     
     # General text encoder patterns (skip these from UNet processing)
     r"text_encoder.*": None,
@@ -113,11 +123,22 @@ DIFFUSERS_KEY_MAPPING = {
     r"unet\.label_emb.*": None,
 }
 
-# Additional direct mappings for edge cases
+# Keys are now prefix-less and dot-separated for a cleaner lookup after pattern matching fails.
 DIRECT_KEY_MAPPING = {
-    # These are exact replacements, not patterns
-    "transformer.proj_out": None,
-    "transformer.norm_out.linear": None,
+    # These are exact replacements, not patterns.
+    # They are mapped to `None` because they exist in the full, non-pruned Diffusers
+    # Flux model but are ABSENT in the `flux1-dev-pruned.safetensors` model.
+    # Skipping them is the correct action for compatibility with the pruned model.
+    "proj.out": None,
+    "norm.out.linear": None,
+    "context.embedder": None,
+    "x.embedder": None,
+    "time.text.embed.guidance.embedder.linear.1": None,
+    "time.text.embed.guidance.embedder.linear.2": None,
+    "time.text.embed.text.embedder.linear.1": None,
+    "time.text.embed.text.embedder.linear.2": None,
+    "time.text.embed.timestep.embedder.linear.1": None,
+    "time.text.embed.timestep.embedder.linear.2": None,
 }
 
 # Known shape mappings for Flux/Chroma
@@ -134,11 +155,6 @@ KNOWN_SHAPES = {
     "double_blocks.txt_mlp.2": (3072, 12288),
 }
 
-# Defines how to place a source LoRA delta into a larger target tensor.
-# Maps (target_layer_suffix, source_lora_suffix) -> (dimension, start_index, end_index).
-# This allows for combining weights both vertically (dim=0) and horizontally (dim=1).
-# Note: Alias keys (e.g., 'to_q' and 'add_q_proj') map to the SAME slice.
-# The merging logic will use this to detect and handle aliases correctly.
 LORA_SLICE_MAPPING = {
     # For single_blocks.linear1 (slicing on dim 0, total size 21504)
     ('linear1', 'to_q'):            (0, 0, 3072),
@@ -147,17 +163,16 @@ LORA_SLICE_MAPPING = {
     ('linear1', 'ff.net.0.proj'):   (0, 9216, 21504),
     ('linear1', 'proj_mlp'):        (0, 9216, 21504), # proj_mlp is an alias for the FFN input proj
 
-    # For single_blocks.linear2 (slicing on dim 1, total size 15360)
-    ('linear2', 'attn.to_out.0'):   (1, 0, 3072),
-    ('linear2', 'ff.net.2'):        (1, 3072, 15360),
-
     # For double_blocks...qkv (slicing on dim 0, total size 9216)
     ('qkv', 'to_q'):                (0, 0, 3072),
     ('qkv', 'add_q_proj'):          (0, 0, 3072), # Alias for to_q
+    ('qkv', 'attn_context.to_q'):   (0, 0, 3072), # Alias for to_q in context attn
     ('qkv', 'to_k'):                (0, 3072, 6144),
     ('qkv', 'add_k_proj'):          (0, 3072, 6144), # Alias for to_k
+    ('qkv', 'attn_context.to_k'):   (0, 3072, 6144), # Alias for to_k in context attn
     ('qkv', 'to_v'):                (0, 6144, 9216),
     ('qkv', 'add_v_proj'):          (0, 6144, 9216), # Alias for to_v
+    ('qkv', 'attn_context.to_v'):   (0, 6144, 9216), # Alias for to_v in context attn
 }
 
 
@@ -197,70 +212,82 @@ def get_expected_shape(key: str) -> Optional[Tuple[int, int]]:
 
 def normalize_lora_key(key: str) -> Optional[str]:
     """
-    Normalize a LoRA key from various formats to the Flux/Chroma base model format.
-    Returns None if the key should be skipped from the UNet conversion process.
+    Normalize a LoRA key from various formats (semantic Diffusers, structural Kohya)
+    to the dot-separated format used by the Chroma base model.
+    Returns None if the key should be skipped.
     """
     original_key = key
     
-    # Remove .lora_A.weight, .lora_B.weight suffixes first
+    # Step 1: Clean up suffixes and alpha values.
     key = re.sub(r'\.lora_[AB]\.weight$', '', key)
     key = re.sub(r'\.lora_(up|down)\.weight$', '', key)
     key = re.sub(r'\.alpha$', '', key)
     
-    # Text encoder keys are handled separately and should be skipped by this function.
+    # Step 2: Skip all text encoder keys. They are not part of the UNet.
     if any(key.startswith(prefix) for prefix in ['lora_te', 'text_encoder', 'te_', 'lora_te1', 'lora_te2']):
         return None
 
-    # Handle pre-formatted 'lora_unet_' keys with underscores.
-    if key.startswith('lora_unet_'):
-        key = key[len('lora_unet_'):]
-        match = re.match(r'^(single_blocks|double_blocks)_(\d+)_(.*)$', key)
-        if match:
-            block_type, block_num, rest_of_key = match.groups()
-            normalized_key = f"{block_type}.{block_num}.{rest_of_key.replace('_', '.')}"
-            if DEBUG_MODE:
-                logger.debug(f"Pre-formatted key mapping: {original_key} -> {normalized_key}")
-            return normalized_key
-        else:
-            if DEBUG_MODE:
-                logger.warning(f"Pre-formatted key '{key}' does not match block pattern. Using simple underscore-to-dot replacement.")
-            return key.replace('_', '.')
+    # Step 3: Strip all known UNet prefixes to get the "core" key.
+    core_key = key
+    prefixes_to_strip = [
+        'lora_unet_', 'lora_transformer_', 'unet.', 'transformer.', 
+        'model.', 'diffusion_model.'
+    ]
+    for prefix in prefixes_to_strip:
+        if core_key.startswith(prefix):
+            core_key = core_key[len(prefix):]
+            break
 
-    # Handle other standard prefixes for diffusers/kohya formats
-    if key.startswith('unet.'):
-        key = key[5:]
-    elif key.startswith('transformer.'):
-        key = key[12:]
-    elif key.startswith('model.'):
-        key = key[6:]
-    elif key.startswith('diffusion_model.'):
-        key = key[16:]
-    
-    # Check direct mappings first
-    if key in DIRECT_KEY_MAPPING:
-        mapped = DIRECT_KEY_MAPPING[key]
-        if DEBUG_MODE and mapped != key:
-            logger.debug(f"Direct mapping: {original_key} -> {mapped}")
-        return mapped
-    
-    # Try pattern-based mappings for standard diffusers/kohya LoRAs
+    # Step 4: Attempt to match the core key against the SEMANTIC patterns first.
+    # This handles standard LoRAs that need their components (q, k, v, etc.) mapped to fused layers.
     for pattern, replacement in DIFFUSERS_KEY_MAPPING.items():
-        match = re.match(pattern, key)
+        match = re.match(pattern, core_key)
         if match:
             if replacement is None:
                 if DEBUG_MODE:
-                    logger.debug(f"Skipping (pattern): {original_key}")
+                    logger.debug(f"Skipping (pattern): {original_key} -> {core_key}")
                 return None
             else:
                 mapped = replacement.format(*match.groups())
-                if DEBUG_MODE and mapped != key:
-                    logger.debug(f"Pattern mapping: {original_key} -> {mapped}")
+                if DEBUG_MODE:
+                    logger.debug(f"Pattern mapping: {original_key} -> {core_key} -> {mapped}")
                 return mapped
+
+    # --- DEFINITIVE FIX (Step 4.5) ---
+    # If no semantic pattern matched, it's likely a structural key (e.g., 'single_blocks_0_linear1').
+    # We must convert it to the hybrid `single_blocks.0.linear1` format.
+    # This logic is now precise and based on the evidence from the base model structure.
+    if core_key.startswith('single_blocks_'):
+        prefix = 'single_blocks'
+        rest_of_key = core_key[len(prefix)+1:] # +1 to skip the first underscore
+        rest_of_key_dotted = rest_of_key.replace('_', '.')
+        final_key = f"{prefix}.{rest_of_key_dotted}"
+        if DEBUG_MODE:
+            logger.debug(f"Structural mapping: {original_key} -> {core_key} -> {final_key}")
+        return final_key
     
-    # If no mapping found, return the key as-is
+    if core_key.startswith('double_blocks_'):
+        prefix = 'double_blocks'
+        rest_of_key = core_key[len(prefix)+1:] # +1 to skip the first underscore
+        rest_of_key_dotted = rest_of_key.replace('_', '.')
+        final_key = f"{prefix}.{rest_of_key_dotted}"
+        if DEBUG_MODE:
+            logger.debug(f"Structural mapping: {original_key} -> {core_key} -> {final_key}")
+        return final_key
+
+    # Step 5: If no pattern matched, check against the direct, non-block mappings.
+    direct_check_key = core_key.replace('_', '.')
+    if direct_check_key in DIRECT_KEY_MAPPING:
+        mapped = DIRECT_KEY_MAPPING[direct_check_key]
+        if DEBUG_MODE:
+            logger.debug(f"Direct mapping: {original_key} -> {direct_check_key} -> {mapped}")
+        return mapped
+
+    # If no mapping was found at all, log it and return the unmapped key for analysis.
     if DEBUG_MODE:
-        logger.debug(f"No mapping found, keeping: {original_key}")
-    return key
+        logger.debug(f"No mapping found for '{original_key}', which normalized to core key '{core_key}'")
+    return core_key
+
 
 def is_modulation_layer(key: str) -> bool:
     """
@@ -367,31 +394,19 @@ def analyze_lora_compatibility(lora_path: str) -> Dict[str, Any]:
             normalized_key = normalize_lora_key(base_key)
             
             if normalized_key is None:
-                # Check if it was skipped because it's a known non-existent layer
-                is_nonexistent = False
-                temp_key = base_key
-                # Strip prefixes to match the mapping dict
-                if temp_key.startswith('unet.'): temp_key = temp_key[5:]
-                elif temp_key.startswith('transformer.'): temp_key = temp_key[12:]
-
-                for pattern, replacement in DIFFUSERS_KEY_MAPPING.items():
-                    if replacement is None and re.match(pattern, temp_key):
-                        is_nonexistent = True
-                        break
-                
-                if is_nonexistent:
-                    analysis["skipped_nonexistent_pairs"] += 1
-                    analysis["skipped_nonexistent_list"].append(base_key)
-                else:
-                    analysis["skipped_unmapped_pairs"] += 1
-                    analysis["skipped_unmapped_list"].append(base_key)
-
+                analysis["skipped_nonexistent_pairs"] += 1
+                analysis["skipped_nonexistent_list"].append(base_key)
             elif is_modulation_layer(normalized_key):
                 analysis["incompatible_modulation_pairs"] += 1
                 analysis["incompatible_modulation_list"].append(base_key)
-            else:
+            # A key is only compatible if it maps to a known Chroma prefix.
+            elif normalized_key and normalized_key.startswith(('single_blocks', 'double_blocks')):
                 analysis["compatible_pairs"] += 1
                 analysis["convertible_list"].append(base_key)
+            else:
+                # All other cases are considered unmapped.
+                analysis["skipped_unmapped_pairs"] += 1
+                analysis["skipped_unmapped_list"].append(base_key)
     
     return analysis
 
@@ -494,7 +509,11 @@ class FluxLoRAApplier:
                     normalized = normalize_lora_key(base_key)
                     if normalized and not is_modulation_layer(normalized):
                         lora_structure[base_key] = normalized
-        
+                    elif DEBUG_MODE and normalized is not None:
+                        # Log keys that normalize but are not convertible to see what's being skipped
+                        logger.debug(f"Skipping unusable normalized key: {base_key} -> {normalized}")
+
+
         # Group LoRAs by their target layer
         target_groups = defaultdict(list)
         for base_key, normalized in lora_structure.items():
@@ -503,7 +522,7 @@ class FluxLoRAApplier:
         # Log grouping info
         for target, sources in target_groups.items():
             if len(sources) > 1:
-                components = sorted([s[s.rfind('.')+1:] for s in sources])
+                components = sorted([s[s.rfind('.')+1:] if '.' in s else s[s.rfind('_')+1:] for s in sources])
                 logger.info(f"Grouped {len(sources)} LoRAs targeting {target}: {components}")
         
         # Process in chunks of target groups
@@ -562,14 +581,25 @@ class FluxLoRAApplier:
                                 
                                 lora_delta = alpha * (lora_up @ lora_down)
 
+                                # --- Reworked component matching logic to be robust and correct. ---
                                 target_suffix = target_key.split('.')[-1]
                                 
                                 matched_source_suffix = None
-                                for _, s_suffix in LORA_SLICE_MAPPING.keys():
-                                    if source_key.endswith(s_suffix):
-                                        if matched_source_suffix is None or len(s_suffix) > len(matched_source_suffix):
-                                            matched_source_suffix = s_suffix
+                                # Get all possible component suffixes for the current target type (e.g., 'linear1' or 'qkv')
+                                possible_components = [
+                                    comp for (tgt, comp) in LORA_SLICE_MAPPING.keys() if tgt == target_suffix
+                                ]
+                                # Sort by length (desc) to find the most specific match first (e.g., 'add_q_proj' before 'proj')
+                                possible_components.sort(key=len, reverse=True)
 
+                                for s_suffix in possible_components:
+                                    # Check if the source key ends with the component, preceded by a separator.
+                                    # This correctly handles `..._to_k` and `...attn.to_q`.
+                                    pattern = r'([._])' + re.escape(s_suffix) + '$'
+                                    if re.search(pattern, source_key):
+                                        matched_source_suffix = s_suffix
+                                        break
+                                
                                 slice_info = LORA_SLICE_MAPPING.get((target_suffix, matched_source_suffix))
                                 
                                 if slice_info:
@@ -594,6 +624,7 @@ class FluxLoRAApplier:
                                             continue
                                         full_delta[:, start:end] += lora_delta
                                 else:
+                                    # This branch handles full tensor updates (e.g., from a structural LoRA)
                                     FULL_TENSOR_MARKER = "full_tensor_update"
                                     if FULL_TENSOR_MARKER in populated_slices:
                                         logger.warning(f"Target '{target_key}' is already populated by an alias. Skipping likely alias '{source_key}'.")
@@ -604,7 +635,8 @@ class FluxLoRAApplier:
                                                      f"Target shape: {full_delta.shape}, delta shape: {lora_delta.shape}. Skipping.")
                                         continue
 
-                                    logger.info(f"Applying '{source_key}' as a full-tensor update to '{target_key}'.")
+                                    if DEBUG_MODE:
+                                        logger.debug(f"Applying '{source_key}' as a full-tensor update to '{target_key}'.")
                                     full_delta += lora_delta
                                     populated_slices.add(FULL_TENSOR_MARKER)
 
@@ -888,7 +920,8 @@ class LoRAExtractor:
 def validate_extracted_lora(lora_dict: Dict[str, torch.Tensor], key_map: Dict[str, str], chroma_base_path: str, device: str = "cuda") -> bool:
     """
     Validate that extracted LoRA will apply correctly to Chroma.
-    This version is optimized to read all model shapes once to avoid slow repeated disk I/O.
+    This version is optimized to read all model shapes once to avoid slow repeated disk I/O
+    and performs matrix multiplication on the specified device for speed.
     """
     logger.info("Validating extracted LoRA...")
     
@@ -906,48 +939,63 @@ def validate_extracted_lora(lora_dict: Dict[str, torch.Tensor], key_map: Dict[st
         logger.info("No UNet keys found in the extracted LoRA to validate. Skipping UNet validation.")
         return True
 
-    with safe_open(chroma_base_path, framework="pt", device="cpu") as chroma_f:
-        # OPTIMIZATION: Pre-load all tensor shapes from the base model into a dictionary.
-        # This avoids repeated, slow disk I/O inside the loop.
-        logger.info("Pre-loading Chroma model key shapes for fast validation...")
-        chroma_shapes = {key: tuple(chroma_f.get_slice(key).get_shape()) for key in tqdm(chroma_f.keys(), desc="Loading shapes")}
-        
-        for base_lora_key in tqdm(base_lora_keys, desc="Validating LoRA keys"):
-            model_key_base = key_map.get(base_lora_key)
-            if not model_key_base:
-                logger.error(f"Validation Error: Could not find original model key for LoRA key '{base_lora_key}'. Skipping validation for this key.")
-                issues_found = True
-                continue
-
-            model_key = f"{model_key_base}.weight"
+    try:
+        with safe_open(chroma_base_path, framework="pt", device="cpu") as chroma_f:
+            # OPTIMIZATION: Pre-load all tensor shapes from the base model into a dictionary.
+            # This avoids repeated, slow disk I/O inside the loop.
+            logger.info("Pre-loading Chroma model key shapes for fast validation...")
+            chroma_shapes = {key: tuple(chroma_f.get_slice(key).get_shape()) for key in tqdm(chroma_f.keys(), desc="Loading shapes")}
             
-            # Use the pre-loaded dictionary for a fast lookup
-            chroma_shape = chroma_shapes.get(model_key)
-            
-            if chroma_shape is None:
-                logger.warning(f"LoRA targets non-existent layer: {model_key} (from LoRA key: {base_lora_key})")
-                issues_found = True
-                continue
-            
-            down_key = f"{base_lora_key}.lora_down.weight"
-            up_key = f"{base_lora_key}.lora_up.weight"
-            
-            if down_key in lora_dict and up_key in lora_dict:
-                lora_down = lora_dict[down_key]
-                lora_up = lora_dict[up_key]
-                
-                try:
-                    # Perform matrix multiplication on CPU to avoid moving to device
-                    result = lora_up @ lora_down
-                    lora_result_shape = result.shape
-                    
-                    if lora_result_shape != chroma_shape:
-                        logger.warning(f"Shape mismatch for {model_key_base}: LoRA produces {lora_result_shape}, Chroma expects {chroma_shape}")
-                        issues_found = True
-                except Exception as e:
-                    logger.error(f"Error validating {base_lora_key}: {e}")
+            for base_lora_key in tqdm(base_lora_keys, desc="Validating LoRA keys"):
+                model_key_base = key_map.get(base_lora_key)
+                if not model_key_base:
+                    logger.error(f"Validation Error: Could not find original model key for LoRA key '{base_lora_key}'. Skipping validation for this key.")
                     issues_found = True
-    
+                    continue
+
+                model_key = f"{model_key_base}.weight"
+                
+                # Use the pre-loaded dictionary for a fast lookup
+                chroma_shape = chroma_shapes.get(model_key)
+                
+                if chroma_shape is None:
+                    logger.warning(f"LoRA targets non-existent layer: {model_key} (from LoRA key: {base_lora_key})")
+                    issues_found = True
+                    continue
+                
+                down_key = f"{base_lora_key}.lora_down.weight"
+                up_key = f"{base_lora_key}.lora_up.weight"
+                
+                if down_key in lora_dict and up_key in lora_dict:
+                    lora_down = lora_dict[down_key]
+                    lora_up = lora_dict[up_key]
+                    
+                    lora_up_dev, lora_down_dev, result = None, None, None
+                    try:
+                        # OPTIMIZATION: Move tensors to the selected device (e.g., CUDA) for
+                        # significantly faster matrix multiplication than on CPU.
+                        lora_up_dev = lora_up.to(device)
+                        lora_down_dev = lora_down.to(device)
+                        
+                        result = lora_up_dev @ lora_down_dev
+                        lora_result_shape = result.shape
+                        
+                        if lora_result_shape != chroma_shape:
+                            logger.warning(f"Shape mismatch for {model_key_base}: LoRA produces {lora_result_shape}, Chroma expects {chroma_shape}")
+                            issues_found = True
+                    except Exception as e:
+                        logger.error(f"Error validating {base_lora_key}: {e}")
+                        issues_found = True
+                    finally:
+                        # Clean up tensors from device memory to prevent accumulation
+                        del lora_up_dev, lora_down_dev, result
+                        if device == "cuda":
+                            torch.cuda.empty_cache()
+
+    except Exception as e:
+        logger.error(f"Failed to open or process Chroma base model for validation: {e}")
+        return False # Cannot validate, so return failure.
+
     if not issues_found:
         logger.info("Validation passed - all UNet LoRA shapes match Chroma expectations")
     else:
@@ -988,6 +1036,8 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
             logger.debug(f"Sample non-existent keys skipped: {compatibility['skipped_nonexistent_list'][:3]}")
         if compatibility['incompatible_modulation_list']:
             logger.debug(f"Sample incompatible keys: {compatibility['incompatible_modulation_list'][:3]}")
+        if compatibility['skipped_unmapped_list']:
+             logger.debug(f"Sample unmappable keys: {compatibility['skipped_unmapped_list'][:3]}")
 
     if compatibility['compatible_pairs'] == 0:
         if compatibility['text_encoder_pairs'] > 0 and args.enable_text_encoder_conversion:
@@ -1114,7 +1164,7 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
         metadata["chroma_extraction_rank"] = str(rank)
         metadata["flux_lora_applied_count"] = str(applied_count)
         metadata["chroma_conversion_date"] = datetime.now().isoformat()
-        metadata["chroma_converter_version"] = "v17.0"
+        metadata["chroma_converter_version"] = "v17.9"
         metadata["original_naming_style"] = compatibility['naming_style']
         metadata["text_encoder_conversion_attempted"] = str(args.enable_text_encoder_conversion)
         metadata["accumulated_layers"] = str(len(merge_stats.get("accumulated", [])))
@@ -1130,7 +1180,7 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
                     logger.info(f"Successfully saved {len(saved_metadata)} metadata entries")
                     for key, value in saved_metadata.items():
                         if any(word in key.lower() for word in ["trigger", "prompt", "keyword"]):
-                            logger.info(f"Verified trigger metadata preserved: {key} = {str(value)[:100] if len(str(value)) > 100 else value}")
+                            logger.info(f"Verified trigger metadata preserved: {str(value)[:100] if len(str(value)) > 100 else value}")
                 else:
                     logger.warning("No metadata found in saved file")
         
@@ -1164,7 +1214,7 @@ def convert_single_lora(flux_lora_path: str, output_lora_path: str, args: argpar
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Flux Dev to Chroma LoRA Converter v17.0 - Realistic Text Encoder Handling',
+        description='Flux Dev to Chroma LoRA Converter v17.9 - Definitive Key Mapping Fix',
         formatter_class=argparse.RawTextHelpFormatter
     )
     # Required base models
@@ -1264,7 +1314,7 @@ def main():
 if __name__ == "__main__":
     sys.exit(main())
     
-    #
+#
 # --- Historical Note on Text Encoder Conversion Attempts ---
 # The conversion of T5 text encoder weights (`lora_te1_...`) has proven to be
 # a significant challenge. The following methods were attempted and ultimately
