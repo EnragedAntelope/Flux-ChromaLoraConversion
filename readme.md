@@ -2,7 +2,7 @@
 
 > **⚠️ DEPRECATED - NO LONGER MAINTAINED**
 >
-> This repository is no longer actively maintained. As of late 2024, **ComfyUI natively handles remapping of compatible keys from Flux LoRAs when applied to Chroma models**, eliminating the need for manual conversion in most workflows.
+> This repository is no longer actively maintained. As of this writing, **ComfyUI natively handles remapping of compatible keys from Flux LoRAs when applied to Chroma models**, eliminating the need for manual conversion in most workflows.
 >
 > This repository remains available for users who:
 > - Work with tools other than ComfyUI that may not support automatic remapping
