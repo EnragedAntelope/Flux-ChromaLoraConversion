@@ -1,5 +1,18 @@
 # Flux to Chroma LoRA Converter & Scanner
 
+> **⚠️ DEPRECATED - NO LONGER MAINTAINED**
+>
+> This repository is no longer actively maintained. As of late 2024, **ComfyUI natively handles remapping of compatible keys from Flux LoRAs when applied to Chroma models**, eliminating the need for manual conversion in most workflows.
+>
+> This repository remains available for users who:
+> - Work with tools other than ComfyUI that may not support automatic remapping
+> - Need manual control over the conversion process
+> - Are working with legacy workflows
+>
+> No further updates, bug fixes, or support will be provided.
+
+---
+
 This repository contains a set of tools to convert LoRAs made for the Flux model to be compatible with Chroma, a heavily modified and more efficient variant. It includes a powerful converter and an essential pre-flight compatibility scanner.
 
 ## 🎯 Overview
